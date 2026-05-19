@@ -9,10 +9,10 @@ from typing import Any
 
 import aiohttp
 
+import astrbot.api.message_components as Comp
 from astrbot.api import AstrBotConfig, logger
 from astrbot.api.event import AstrMessageEvent, MessageChain, filter
 from astrbot.api.star import Context, Star
-import astrbot.api.message_components as Comp
 
 PLUGIN_NAME = "astrbot_plugin_dracalon_feed"
 USER_AGENT = "Dracalon-AstrBot-Feed/0.1"
@@ -246,15 +246,16 @@ class DracalonFeedPlugin(Star):
         if items is None:
             return  # fetch 已记录 last_error
 
-        pushed: dict[str, int] = self._state.setdefault("pushed_urls", {})
+        self._state.setdefault("pushed_urls", {})
 
         if not self._state.get("bootstrap_done"):
-            items_to_push = self._apply_bootstrap(items, pushed)
+            items_to_push = self._apply_bootstrap(items)
         else:
+            pushed_snapshot = self._state["pushed_urls"]
             items_to_push = [
                 it
                 for it in items
-                if it.get("url") and _url_hash(it["url"]) not in pushed
+                if it.get("url") and _url_hash(it["url"]) not in pushed_snapshot
             ]
 
         items_to_push.sort(key=lambda x: str(x.get("published_at") or ""))
@@ -274,7 +275,9 @@ class DracalonFeedPlugin(Star):
                     )
                 await asyncio.sleep(INTER_TARGET_DELAY)
             async with self._lock:
-                pushed[_url_hash(url)] = int(time.time())
+                # 通过 self._state["pushed_urls"] 间接写，避免持有局部引用
+                # 在 _prune_old_dedup 替换 dict 后导致写入丢失
+                self._state["pushed_urls"][_url_hash(url)] = int(time.time())
             await self._save_state()
             await asyncio.sleep(INTER_ITEM_DELAY)
 
@@ -326,11 +329,12 @@ class DracalonFeedPlugin(Star):
         return [it for it in items if isinstance(it, dict) and it.get("url")]
 
     def _apply_bootstrap(
-        self, items: list[dict[str, Any]], pushed: dict[str, int]
+        self, items: list[dict[str, Any]]
     ) -> list[dict[str, Any]]:
         mode = str(self.config.get("bootstrap_mode", "latest_one"))
         now = int(time.time())
         self._state["bootstrap_done"] = True
+        pushed = self._state["pushed_urls"]
 
         if mode == "push_all":
             return list(items)
@@ -434,14 +438,18 @@ class DracalonFeedPlugin(Star):
                 "bootstrap_done": bool(self._state.get("bootstrap_done", False)),
             }
         try:
-            tmp_path = self._state_path.with_suffix(".json.tmp")
-            tmp_path.write_text(
-                json.dumps(snapshot, ensure_ascii=False, indent=2),
-                encoding="utf-8",
-            )
-            tmp_path.replace(self._state_path)
+            # 文件 IO 是同步阻塞调用，丢到线程池避免阻塞 event loop
+            await asyncio.to_thread(self._write_state_file, snapshot)
         except Exception as e:
             logger.error(f"[{PLUGIN_NAME}] save state failed: {e}")
+
+    def _write_state_file(self, snapshot: dict[str, Any]) -> None:
+        tmp_path = self._state_path.with_suffix(".json.tmp")
+        tmp_path.write_text(
+            json.dumps(snapshot, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        tmp_path.replace(self._state_path)
 
     def _prune_old_dedup(self) -> None:
         retention_days = max(
