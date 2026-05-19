@@ -48,10 +48,10 @@
     "hint": "超过此天数的已推送记录会被清除"
   },
   "enabled": {
-    "description": "启用插件",
+    "description": "启用推送系统",
     "type": "bool",
     "default": true,
-    "hint": "设为 false 可临时暂停推送而无需卸载插件"
+    "hint": "设为 false 可临时停用自动推送（命令仍可用）"
   },
   "startup_delay_seconds": {
     "description": "启动后等待秒数再开始第一次轮询",

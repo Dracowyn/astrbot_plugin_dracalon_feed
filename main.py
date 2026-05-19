@@ -24,6 +24,33 @@ def _url_hash(url: str) -> str:
     return hashlib.sha256(url.encode("utf-8")).hexdigest()[:16]
 
 
+def _friendly_umo(umo: str) -> str:
+    """把 unified_msg_origin 转成人类可读，识别失败原样返回。
+
+    示例：
+        aiocqhttp:GroupMessage:123456 → QQ 群 123456
+        aiocqhttp:FriendMessage:123456 → QQ 私聊 123456
+        qq_official:GroupMessage:xxxx → QQ 频道 xxxx
+    """
+    if not umo:
+        return "(未知会话)"
+    parts = umo.split(":", 2)
+    if len(parts) != 3:
+        return umo
+    platform, msg_type, session_id = parts
+    if platform == "aiocqhttp":
+        if msg_type == "GroupMessage":
+            return f"QQ 群 {session_id}"
+        if msg_type in ("FriendMessage", "PrivateMessage"):
+            return f"QQ 私聊 {session_id}"
+    if platform == "qq_official":
+        if msg_type == "GroupMessage":
+            return f"QQ 频道 {session_id}"
+        if msg_type == "DirectMessage":
+            return f"QQ 频道私信 {session_id}"
+    return umo
+
+
 def _resolve_data_dir() -> Path:
     try:
         from astrbot.core.utils.astrbot_path import get_astrbot_data_path
@@ -70,75 +97,84 @@ class DracalonFeedPlugin(Star):
     @filter.permission_type(filter.PermissionType.ADMIN)
     @dracalon_feed.command("bind")
     async def bind(self, event: AstrMessageEvent):
-        """把当前会话加入推送列表"""
+        """把当前群加入新帖推送列表"""
         umo = event.unified_msg_origin
+        friendly = _friendly_umo(umo)
         targets = list(self.config.get("targets", []) or [])
         if umo in targets:
-            yield event.plain_result(f"当前会话已绑定：{umo}")
+            yield event.plain_result(f"当前 {friendly} 已经在推送列表里啦~")
             return
         self.config["targets"] = targets + [umo]
         self.config.save_config()
-        yield event.plain_result(f"已绑定推送目标：{umo}")
+        yield event.plain_result(
+            f"已绑定到 {friendly}，之后新帖会自动推送到这里。"
+        )
 
     @filter.permission_type(filter.PermissionType.ADMIN)
     @dracalon_feed.command("unbind")
     async def unbind(self, event: AstrMessageEvent):
-        """把当前会话从推送列表移除"""
+        """把当前群从推送列表移除"""
         umo = event.unified_msg_origin
+        friendly = _friendly_umo(umo)
         targets = list(self.config.get("targets", []) or [])
         if umo not in targets:
-            yield event.plain_result(f"当前会话未绑定：{umo}")
+            yield event.plain_result(f"当前 {friendly} 还未绑定推送")
             return
         targets.remove(umo)
         self.config["targets"] = targets
         self.config.save_config()
-        yield event.plain_result(f"已解绑：{umo}")
+        yield event.plain_result(f"已取消 {friendly} 的推送绑定")
 
     @filter.permission_type(filter.PermissionType.ADMIN)
     @dracalon_feed.command("list")
     async def list_targets(self, event: AstrMessageEvent):
-        """列出全部推送目标"""
+        """查看已绑定的推送目标"""
         targets = list(self.config.get("targets", []) or [])
         if not targets:
-            yield event.plain_result("当前未绑定任何推送目标")
+            yield event.plain_result(
+                "当前还没有绑定任何推送目标。\n"
+                "在想推送到的群里发 /dracalon_feed bind 即可绑定。"
+            )
             return
         lines = [f"共 {len(targets)} 个推送目标："]
-        lines.extend(f"  {idx}. {t}" for idx, t in enumerate(targets, 1))
+        lines.extend(
+            f"  {idx}. {_friendly_umo(t)}" for idx, t in enumerate(targets, 1)
+        )
         yield event.plain_result("\n".join(lines))
 
     @filter.permission_type(filter.PermissionType.ADMIN)
     @dracalon_feed.command("status")
     async def status(self, event: AstrMessageEvent):
-        """显示插件运行状态"""
+        """查看推送系统运行状态"""
         last_poll_at = int(self._state.get("last_poll_at", 0) or 0)
         last_poll_str = (
             time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(last_poll_at))
             if last_poll_at
-            else "从未"
+            else "尚未轮询过"
         )
-        enabled = self.config.get("enabled", True)
+        enabled = bool(self.config.get("enabled", True))
         targets = self.config.get("targets", []) or []
         pushed_count = len(self._state.get("pushed_urls", {}) or {})
         last_error = self._state.get("last_error") or "无"
-        bootstrap_done = self._state.get("bootstrap_done", False)
+        bootstrap_done = bool(self._state.get("bootstrap_done", False))
 
         lines = [
-            f"[{PLUGIN_NAME}] 状态",
-            f"  启用：{enabled}",
+            "Dracalon 新帖订阅 · 当前状态",
+            f"  推送开关：{'已启用' if enabled else '已暂停'}",
             f"  上次轮询：{last_poll_str}",
             f"  上次错误：{last_error}",
-            f"  已推送条目：{pushed_count}",
-            f"  推送目标数：{len(targets)}",
-            f"  首次启动完成：{bootstrap_done}",
+            f"  累计已推送条目：{pushed_count}",
+            f"  绑定目标数：{len(targets)}",
+            f"  首次启动初始化：{'已完成' if bootstrap_done else '尚未完成'}",
         ]
         yield event.plain_result("\n".join(lines))
 
     @filter.permission_type(filter.PermissionType.ADMIN)
     @dracalon_feed.command("test")
     async def test(self, event: AstrMessageEvent):
-        """绕过去重，立刻拉最新 1 条推到当前会话"""
+        """立即推一条最新帖到当前群（测试用）"""
         if self._session is None:
-            yield event.plain_result("插件尚未完成初始化，请稍后再试")
+            yield event.plain_result("系统还在启动中，请等几秒后再试")
             return
         try:
             items = await self._fetch()
@@ -147,7 +183,7 @@ class DracalonFeedPlugin(Star):
             yield event.plain_result(f"拉取失败：{e}")
             return
         if not items:
-            yield event.plain_result("拉取成功但当前列表为空")
+            yield event.plain_result("已成功访问后端，但当前没有可推送的帖子")
             return
         latest = sorted(
             items, key=lambda x: str(x.get("published_at") or ""), reverse=True
@@ -164,7 +200,7 @@ class DracalonFeedPlugin(Star):
     @filter.permission_type(filter.PermissionType.ADMIN)
     @dracalon_feed.command("pause")
     async def pause(self, event: AstrMessageEvent):
-        """暂停推送（不卸载插件）"""
+        """暂停自动推送（不影响命令）"""
         self.config["enabled"] = False
         self.config.save_config()
         yield event.plain_result("已暂停推送")
@@ -172,7 +208,7 @@ class DracalonFeedPlugin(Star):
     @filter.permission_type(filter.PermissionType.ADMIN)
     @dracalon_feed.command("resume")
     async def resume(self, event: AstrMessageEvent):
-        """恢复推送"""
+        """恢复自动推送"""
         self.config["enabled"] = True
         self.config.save_config()
         yield event.plain_result("已恢复推送")
