@@ -1,0 +1,69 @@
+{
+  "api_base": {
+    "description": "后端 API 根地址",
+    "type": "string",
+    "default": "https://dracalon.com",
+    "hint": "不含末尾斜杠。请求路径固定为 /api/homepage/feed"
+  },
+  "feed_key": {
+    "description": "Feed 数据源 key",
+    "type": "string",
+    "default": "community_hot",
+    "hint": "后端白名单值：community_hot / wiki_hot"
+  },
+  "poll_interval_seconds": {
+    "description": "轮询间隔（秒）",
+    "type": "int",
+    "default": 120,
+    "hint": "后端 60s 一个 tick，建议 120-300"
+  },
+  "request_timeout_seconds": {
+    "description": "HTTP 请求超时（秒）",
+    "type": "int",
+    "default": 15
+  },
+  "max_images_per_post": {
+    "description": "每条帖子最多发送图片数",
+    "type": "int",
+    "default": 3,
+    "hint": "QQ 群单条消息图片过多容易触发风控，建议不超过 3"
+  },
+  "targets": {
+    "description": "推送目标（unified_msg_origin 列表）",
+    "type": "list",
+    "default": [],
+    "hint": "格式：aiocqhttp:GroupMessage:<群号>。建议在群内用 /dracalon_feed bind 命令自动添加"
+  },
+  "bootstrap_mode": {
+    "description": "首次启动行为",
+    "type": "string",
+    "default": "latest_one",
+    "options": ["latest_one", "mark_all", "push_all"],
+    "hint": "latest_one=只推最新1条其余标记已读；mark_all=全部标记已读不推；push_all=全部推送（慎用）"
+  },
+  "dedup_retention_days": {
+    "description": "去重记录保留天数",
+    "type": "int",
+    "default": 30,
+    "hint": "超过此天数的已推送记录会被清除"
+  },
+  "enabled": {
+    "description": "启用插件",
+    "type": "bool",
+    "default": true,
+    "hint": "设为 false 可临时暂停推送而无需卸载插件"
+  },
+  "startup_delay_seconds": {
+    "description": "启动后等待秒数再开始第一次轮询",
+    "type": "int",
+    "default": 10,
+    "hint": "给 AstrBot 平台适配器足够的 ready 时间"
+  },
+  "message_style": {
+    "description": "消息排版风格",
+    "type": "string",
+    "default": "rich",
+    "options": ["minimal", "rich"],
+    "hint": "minimal=仅标题+图片+链接；rich=带作者+统计数"
+  }
+}
