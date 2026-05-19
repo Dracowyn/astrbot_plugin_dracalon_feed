@@ -208,7 +208,10 @@ class DracalonFeedPlugin(Star):
                 total=int(self.config.get("request_timeout_seconds", 15) or 15)
             )
             self._session = aiohttp.ClientSession(
-                headers={"User-Agent": USER_AGENT},
+                headers={
+                    "User-Agent": USER_AGENT,
+                    "Server": "true",
+                },
                 timeout=timeout,
             )
             logger.info(f"[{PLUGIN_NAME}] started, polling will begin")
