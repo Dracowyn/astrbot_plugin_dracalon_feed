@@ -53,11 +53,29 @@
     "default": true,
     "hint": "设为 false 可临时停用自动推送（命令仍可用）"
   },
-  "startup_delay_seconds": {
-    "description": "启动后等待秒数再开始第一次轮询",
+  "quiet_hours_enabled": {
+    "description": "启用夜间静默",
+    "type": "bool",
+    "default": false,
+    "hint": "开启后静默时段内不推送，积压到窗口结束再补推（不丢帖）"
+  },
+  "quiet_hours_start": {
+    "description": "静默开始小时(0-23)",
     "type": "int",
-    "default": 10,
-    "hint": "给 AstrBot 平台适配器足够的 ready 时间"
+    "default": 0,
+    "hint": "服务器本地时间整点。示例：23 表示 23:00 开始静默"
+  },
+  "quiet_hours_end": {
+    "description": "静默结束小时(0-23)",
+    "type": "int",
+    "default": 8,
+    "hint": "本地时间整点，静默区间为 [start, end)。跨午夜如 start=23,end=7"
+  },
+  "quiet_hours_max_catchup": {
+    "description": "静默结束后最多补推条数",
+    "type": "int",
+    "default": 5,
+    "hint": "窗口重开时只推最新 N 条积压、其余标记已读防刷屏；0=不限制全部补推"
   },
   "message_style": {
     "description": "消息排版风格",

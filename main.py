@@ -4,7 +4,6 @@ import asyncio
 import hashlib
 import json
 import time
-from pathlib import Path
 from typing import Any
 
 import aiohttp
@@ -12,7 +11,7 @@ import aiohttp
 import astrbot.api.message_components as Comp
 from astrbot.api import AstrBotConfig, logger
 from astrbot.api.event import AstrMessageEvent, MessageChain, filter
-from astrbot.api.star import Context, Star
+from astrbot.api.star import Context, Star, StarTools
 
 PLUGIN_NAME = "astrbot_plugin_dracalon_feed"
 USER_AGENT = "Dracalon-AstrBot-Feed/0.1"
@@ -51,21 +50,13 @@ def _friendly_umo(umo: str) -> str:
     return umo
 
 
-def _resolve_data_dir() -> Path:
-    try:
-        from astrbot.core.utils.astrbot_path import get_astrbot_data_path
-
-        return Path(get_astrbot_data_path())
-    except Exception:
-        return Path.cwd() / "data"
-
-
 def _default_state() -> dict[str, Any]:
     return {
         "pushed_urls": {},
         "last_poll_at": 0,
         "last_error": "",
         "bootstrap_done": False,
+        "was_quiet": False,
     }
 
 
@@ -76,15 +67,11 @@ class DracalonFeedPlugin(Star):
 
         self._session: aiohttp.ClientSession | None = None
         self._poll_task: asyncio.Task | None = None
-        self._start_task: asyncio.Task | None = None
         self._lock = asyncio.Lock()
 
-        state_dir = _resolve_data_dir() / "plugin_data" / PLUGIN_NAME
-        state_dir.mkdir(parents=True, exist_ok=True)
+        state_dir = StarTools.get_data_dir(PLUGIN_NAME)
         self._state_path = state_dir / "state.json"
         self._state = self._load_state()
-
-        self._start_task = asyncio.create_task(self._start())
 
     # ------------------------------------------------------------------
     # 命令组（必须在 class 内定义；子命令通过 @<group_method>.command 注册）
@@ -158,9 +145,18 @@ class DracalonFeedPlugin(Star):
         last_error = self._state.get("last_error") or "无"
         bootstrap_done = bool(self._state.get("bootstrap_done", False))
 
+        if self.config.get("quiet_hours_enabled", False):
+            qs = int(self.config.get("quiet_hours_start", 0) or 0) % 24
+            qe = int(self.config.get("quiet_hours_end", 0) or 0) % 24
+            in_quiet = self._in_quiet_hours(time.localtime())
+            quiet_desc = f"{qs:02d}:00–{qe:02d}:00（{'静默中' if in_quiet else '非静默'}）"
+        else:
+            quiet_desc = "未启用"
+
         lines = [
             "Dracalon 新帖订阅 · 当前状态",
             f"  推送开关：{'已启用' if enabled else '已暂停'}",
+            f"  夜间静默：{quiet_desc}",
             f"  上次轮询：{last_poll_str}",
             f"  上次错误：{last_error}",
             f"  累计已推送条目：{pushed_count}",
@@ -216,46 +212,35 @@ class DracalonFeedPlugin(Star):
     # ------------------------------------------------------------------
     # 生命周期
     # ------------------------------------------------------------------
+    async def initialize(self) -> None:
+        """官方生命周期入口：此时 db/platform 已 ready，建 session 并起轮询。"""
+        timeout = aiohttp.ClientTimeout(
+            total=int(self.config.get("request_timeout_seconds", 15) or 15)
+        )
+        self._session = aiohttp.ClientSession(
+            headers={
+                "User-Agent": USER_AGENT,
+                "Server": "true",
+            },
+            timeout=timeout,
+        )
+        self._poll_task = asyncio.create_task(self._poll_loop())
+        logger.info(f"[{PLUGIN_NAME}] initialized, polling started")
+
     async def terminate(self) -> None:
-        for task in (self._poll_task, self._start_task):
-            if task and not task.done():
-                task.cancel()
-                try:
-                    await task
-                except asyncio.CancelledError:
-                    pass
-                except Exception as e:
-                    logger.warning(f"[{PLUGIN_NAME}] task cleanup error: {e}")
+        if self._poll_task and not self._poll_task.done():
+            self._poll_task.cancel()
+            try:
+                await self._poll_task
+            except asyncio.CancelledError:
+                pass
+            except Exception as e:
+                logger.warning(f"[{PLUGIN_NAME}] task cleanup error: {e}")
         if self._session and not self._session.closed:
             try:
                 await self._session.close()
             except Exception as e:
                 logger.warning(f"[{PLUGIN_NAME}] session close error: {e}")
-
-    # ------------------------------------------------------------------
-    # 启动 & 主循环
-    # ------------------------------------------------------------------
-    async def _start(self) -> None:
-        try:
-            delay = int(self.config.get("startup_delay_seconds", 10) or 0)
-            if delay > 0:
-                await asyncio.sleep(delay)
-            timeout = aiohttp.ClientTimeout(
-                total=int(self.config.get("request_timeout_seconds", 15) or 15)
-            )
-            self._session = aiohttp.ClientSession(
-                headers={
-                    "User-Agent": USER_AGENT,
-                    "Server": "true",
-                },
-                timeout=timeout,
-            )
-            logger.info(f"[{PLUGIN_NAME}] started, polling will begin")
-            self._poll_task = asyncio.create_task(self._poll_loop())
-        except asyncio.CancelledError:
-            raise
-        except Exception as e:
-            logger.error(f"[{PLUGIN_NAME}] _start failed: {e}")
 
     async def _poll_loop(self) -> None:
         try:
@@ -277,6 +262,20 @@ class DracalonFeedPlugin(Star):
         except asyncio.CancelledError:
             return
 
+    def _in_quiet_hours(self, now_struct: time.struct_time) -> bool:
+        """当前是否处于夜间静默时段（本地时间，小时粒度，支持跨午夜）。"""
+        if not self.config.get("quiet_hours_enabled", False):
+            return False
+        start = int(self.config.get("quiet_hours_start", 0) or 0) % 24
+        end = int(self.config.get("quiet_hours_end", 0) or 0) % 24
+        if start == end:
+            return False  # 空区间，视为不静默
+        hour = now_struct.tm_hour
+        if start < end:
+            return start <= hour < end
+        # 跨午夜：如 23 → 7
+        return hour >= start or hour < end
+
     async def _poll_once(self) -> None:
         items = await self._fetch()
         if items is None:
@@ -295,6 +294,36 @@ class DracalonFeedPlugin(Star):
             ]
 
         items_to_push.sort(key=lambda x: str(x.get("published_at") or ""))
+
+        # 夜间静默：窗口内不发送、不标记已推（积压到窗口结束自然补推，不丢帖）
+        if self._in_quiet_hours(time.localtime()):
+            async with self._lock:
+                self._state["was_quiet"] = True
+                self._state["last_poll_at"] = int(time.time())
+                self._state["last_error"] = ""
+            self._prune_old_dedup()
+            await self._save_state()
+            return
+
+        # 刚退出静默且积压超上限：只推最新 N 条，其余标记已读（防早高峰刷屏）
+        max_catchup = int(self.config.get("quiet_hours_max_catchup", 5) or 0)
+        if (
+            bool(self._state.get("was_quiet", False))
+            and max_catchup > 0
+            and len(items_to_push) > max_catchup
+        ):
+            overflow = items_to_push[:-max_catchup]
+            items_to_push = items_to_push[-max_catchup:]
+            now_ts = int(time.time())
+            async with self._lock:
+                for it in overflow:
+                    u = it.get("url") or ""
+                    if u:
+                        self._state["pushed_urls"][_url_hash(u)] = now_ts
+            logger.info(
+                f"[{PLUGIN_NAME}] quiet-hours catch-up: push latest {len(items_to_push)}, "
+                f"mark {len(overflow)} backlog as read"
+            )
 
         targets = list(self.config.get("targets", []) or [])
         for item in items_to_push:
@@ -319,6 +348,7 @@ class DracalonFeedPlugin(Star):
 
         self._prune_old_dedup()
         async with self._lock:
+            self._state["was_quiet"] = False
             self._state["last_poll_at"] = int(time.time())
             self._state["last_error"] = ""
         await self._save_state()
@@ -472,6 +502,7 @@ class DracalonFeedPlugin(Star):
                 "last_poll_at": int(self._state.get("last_poll_at", 0) or 0),
                 "last_error": str(self._state.get("last_error", "") or ""),
                 "bootstrap_done": bool(self._state.get("bootstrap_done", False)),
+                "was_quiet": bool(self._state.get("was_quiet", False)),
             }
         try:
             # 文件 IO 是同步阻塞调用，丢到线程池避免阻塞 event loop
