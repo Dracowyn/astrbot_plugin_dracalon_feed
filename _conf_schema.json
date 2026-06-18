@@ -41,12 +41,6 @@
     "options": ["latest_one", "mark_all", "push_all"],
     "hint": "latest_one=只推最新1条其余标记已读；mark_all=全部标记已读不推；push_all=全部推送（慎用）"
   },
-  "dedup_retention_days": {
-    "description": "去重记录保留天数",
-    "type": "int",
-    "default": 30,
-    "hint": "超过此天数的已推送记录会被清除"
-  },
   "enabled": {
     "description": "启用推送系统",
     "type": "bool",
