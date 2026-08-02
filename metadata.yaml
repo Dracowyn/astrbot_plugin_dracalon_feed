@@ -3,6 +3,7 @@ desc: 订阅 Dracalon 首页 community_hot feed（Discuz + QQ 频道），新帖
 author: dracowyn
 version: 0.3.0
 short_desc: Dracalon 社区新帖订阅推送
+repo: https://github.com/Dracowyn/astrbot_plugin_dracalon_feed
 support_platforms:
   - aiocqhttp
 astrbot_version: ">=4.16,<5"
