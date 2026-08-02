@@ -15,11 +15,13 @@ from astrbot.api.event import AstrMessageEvent, MessageChain, filter
 from astrbot.api.star import Context, Star, StarTools
 
 PLUGIN_NAME = "astrbot_plugin_dracalon_feed"
-USER_AGENT = "Dracalon-AstrBot-Feed/0.2"
+USER_AGENT = "Dracalon-AstrBot-Feed/0.3"
 INTER_TARGET_DELAY = 0.3
 INTER_ITEM_DELAY = 0.5
+RETRY_BASE_SECONDS = 120
+RETRY_MAX_SECONDS = 3600
 
-STATE_SCHEMA = 2
+STATE_SCHEMA = 3
 # 单页拉取条数（后端 FeedService::PAGE_SIZE_MAX = 50，取满）
 FETCH_PAGE_SIZE = 50
 # 深翻页页数上限：覆盖停机后的积压补推；超出说明积压超 PAGE_SIZE*MAX_PAGES 条，
@@ -72,6 +74,7 @@ def _default_state() -> dict[str, Any]:
         "last_error": "",
         "bootstrap_done": False,
         "was_quiet": False,
+        "pending_deliveries": [],
     }
 
 
@@ -111,9 +114,7 @@ class DracalonFeedPlugin(Star):
             return
         self.config["targets"] = targets + [umo]
         self.config.save_config()
-        yield event.plain_result(
-            f"已绑定到 {friendly}，之后新帖会自动推送到这里。"
-        )
+        yield event.plain_result(f"已绑定到 {friendly}，之后新帖会自动推送到这里。")
 
     @filter.permission_type(filter.PermissionType.ADMIN)
     @dracalon_feed.command("unbind")
@@ -142,9 +143,7 @@ class DracalonFeedPlugin(Star):
             )
             return
         lines = [f"共 {len(targets)} 个推送目标："]
-        lines.extend(
-            f"  {idx}. {_friendly_umo(t)}" for idx, t in enumerate(targets, 1)
-        )
+        lines.extend(f"  {idx}. {_friendly_umo(t)}" for idx, t in enumerate(targets, 1))
         yield event.plain_result("\n".join(lines))
 
     @filter.permission_type(filter.PermissionType.ADMIN)
@@ -167,12 +166,19 @@ class DracalonFeedPlugin(Star):
         )
         last_error = self._state.get("last_error") or "无"
         bootstrap_done = bool(self._state.get("bootstrap_done", False))
+        pending_count = sum(
+            len(entry.get("targets", []))
+            for entry in self._state.get("pending_deliveries", [])
+            if isinstance(entry, dict)
+        )
 
         if self.config.get("quiet_hours_enabled", False):
             qs = int(self.config.get("quiet_hours_start", 0) or 0) % 24
             qe = int(self.config.get("quiet_hours_end", 0) or 0) % 24
             in_quiet = self._in_quiet_hours(time.localtime())
-            quiet_desc = f"{qs:02d}:00–{qe:02d}:00（{'静默中' if in_quiet else '非静默'}）"
+            quiet_desc = (
+                f"{qs:02d}:00–{qe:02d}:00（{'静默中' if in_quiet else '非静默'}）"
+            )
         else:
             quiet_desc = "未启用"
 
@@ -184,6 +190,7 @@ class DracalonFeedPlugin(Star):
             f"  上次错误：{last_error}",
             f"  推送水位线：{watermark_str}（早于此发布时间的帖子视为已推）",
             f"  绑定目标数：{len(targets)}",
+            f"  待重试投递数：{pending_count}",
             f"  首次启动初始化：{'已完成' if bootstrap_done else '尚未完成'}",
         ]
         yield event.plain_result("\n".join(lines))
@@ -207,11 +214,11 @@ class DracalonFeedPlugin(Star):
             return
         # 后端 sort=latest 已按发布时间倒序，items[0] 即最新
         chain = self._build_chain(items[0])
-        try:
-            await self.context.send_message(event.unified_msg_origin, chain)
-        except Exception as e:
-            logger.error(f"[{PLUGIN_NAME}] test send failed: {e}")
-            yield event.plain_result(f"发送失败：{e}")
+        failed, error = await self._deliver_to_targets(
+            items[0], [event.unified_msg_origin], chain=chain
+        )
+        if failed:
+            yield event.plain_result(f"发送失败：{error or '平台未接受消息'}")
             return
         yield event.plain_result("已推送 1 条测试帖")
 
@@ -281,11 +288,6 @@ class DracalonFeedPlugin(Star):
                         logger.warning(f"[{PLUGIN_NAME}] poll failed: {e}")
                         async with self._lock:
                             self._state["last_error"] = f"{type(e).__name__}: {e}"
-                            # 已退出静默却轮询失败时清掉 was_quiet：避免遗留标志让后续正常
-                            # 轮询误用「退出静默补推」逻辑而丢弃积压（catch-up 仅应在真正
-                            # 刚退出静默时生效）
-                            if not self._in_quiet_hours(time.localtime()):
-                                self._state["was_quiet"] = False
                         await self._save_state()
                 await asyncio.sleep(interval)
         except asyncio.CancelledError:
@@ -304,6 +306,40 @@ class DracalonFeedPlugin(Star):
             return start <= hour < end
         # 跨午夜：如 23 → 7
         return hour >= start or hour < end
+
+    async def _deliver_to_targets(
+        self,
+        item: dict[str, Any],
+        targets: list[str],
+        chain: MessageChain | None = None,
+    ) -> tuple[list[str], str]:
+        """Deliver one feed item and report targets that need retrying.
+
+        Args:
+            item: Feed item used to build the message and identify log entries.
+            targets: Unified message origins that should receive the item.
+            chain: Optional prebuilt message chain.
+
+        Returns:
+            A tuple containing failed targets and a concise error description.
+        """
+        message = chain or self._build_chain(item)
+        failed: list[str] = []
+        errors: list[str] = []
+        for umo in dict.fromkeys(targets):
+            try:
+                sent = await self.context.send_message(umo, message)
+                if not sent:
+                    raise RuntimeError("no matching platform")
+            except Exception as e:
+                failed.append(umo)
+                errors.append(f"{umo}: {type(e).__name__}: {e}")
+                logger.error(
+                    f"[{PLUGIN_NAME}] delivery to {umo} failed "
+                    f"for item {self._item_key(item) or '(unknown)'}: {e}"
+                )
+            await asyncio.sleep(INTER_TARGET_DELAY)
+        return failed, "; ".join(errors[-3:])
 
     # ------------------------------------------------------------------
     # 轮询主流程
@@ -326,17 +362,22 @@ class DracalonFeedPlugin(Star):
         # 深翻页：page1 是最新一页。若其最旧一条仍 > 水位线且还有更多页，继续往后翻，
         # 直到某页最旧条目 <= 水位线（追平积压）或到上限。覆盖停机一段时间后的补推。
         collected = await self._collect_backlog(items, total, watermark)
+        if collected is None:
+            return  # Abort the poll so an incomplete backlog cannot advance state.
 
         new_items = self._select_new(collected, watermark)
         # 升序推送（旧→新），保证水位线单调推进、同秒帖按 item_key 稳定排序
-        new_items.sort(key=lambda it: (self._ts(it) or 0, str(self._item_key(it) or "")))
+        new_items.sort(
+            key=lambda it: (self._ts(it) or 0, str(self._item_key(it) or ""))
+        )
 
         # 夜间静默：窗口内不发送、不推进水位线（积压留到窗口结束自然补推，不丢帖）
         if self._in_quiet_hours(time.localtime()):
             async with self._lock:
                 self._state["was_quiet"] = True
                 self._state["last_poll_at"] = int(time.time())
-                self._state["last_error"] = ""
+                if not self._state.get("pending_deliveries"):
+                    self._state["last_error"] = ""
             await self._save_state()
             return
 
@@ -355,18 +396,65 @@ class DracalonFeedPlugin(Star):
                 f"skip {len(dropped)} backlog"
             )
 
-        targets = list(self.config.get("targets", []) or [])
+        targets = list(dict.fromkeys(self.config.get("targets", []) or []))
+        delivery_error = (
+            str(self._state.get("last_error", "") or "")
+            if self._state.get("pending_deliveries")
+            else ""
+        )
+
+        # Retry failed targets first without resending to targets that succeeded.
+        pending: list[dict[str, Any]] = []
+        configured_targets = set(targets)
+        now = int(time.time())
+        for entry in list(self._state.get("pending_deliveries", []) or []):
+            if not isinstance(entry, dict) or not isinstance(entry.get("item"), dict):
+                continue
+            retry_targets = [
+                umo
+                for umo in entry.get("targets", [])
+                if isinstance(umo, str) and umo in configured_targets
+            ]
+            if not retry_targets:
+                continue
+            if int(entry.get("next_retry_at", 0) or 0) > now:
+                pending.append({**entry, "targets": retry_targets})
+                continue
+            failed, error = await self._deliver_to_targets(entry["item"], retry_targets)
+            if failed:
+                attempts = int(entry.get("attempts", 0) or 0) + 1
+                pending.append(
+                    {
+                        "item": entry["item"],
+                        "targets": failed,
+                        "attempts": attempts,
+                        "next_retry_at": now
+                        + min(
+                            RETRY_MAX_SECONDS,
+                            RETRY_BASE_SECONDS * 2 ** min(attempts - 1, 5),
+                        ),
+                    }
+                )
+                delivery_error = error or delivery_error
+            await asyncio.sleep(INTER_ITEM_DELAY)
+
+        async with self._lock:
+            self._state["pending_deliveries"] = pending
+        await self._save_state()
+
         for item in new_items:
-            chain = self._build_chain(item)
-            for umo in targets:
-                try:
-                    await self.context.send_message(umo, chain)
-                except Exception as e:
-                    logger.error(
-                        f"[{PLUGIN_NAME}] send_message to {umo} failed: {e}"
-                    )
-                await asyncio.sleep(INTER_TARGET_DELAY)
+            failed, error = await self._deliver_to_targets(item, targets)
             async with self._lock:
+                if failed:
+                    self._state.setdefault("pending_deliveries", []).append(
+                        {
+                            "item": item,
+                            "targets": failed,
+                            "attempts": 1,
+                            "next_retry_at": int(time.time()) + RETRY_BASE_SECONDS,
+                        }
+                    )
+                    delivery_error = error or delivery_error
                 self._advance(item)
             await self._save_state()
             await asyncio.sleep(INTER_ITEM_DELAY)
@@ -380,12 +468,14 @@ class DracalonFeedPlugin(Star):
         async with self._lock:
             self._state["was_quiet"] = False
             self._state["last_poll_at"] = int(time.time())
-            self._state["last_error"] = ""
+            if not self._state.get("pending_deliveries"):
+                delivery_error = ""
+            self._state["last_error"] = delivery_error
         await self._save_state()
 
     async def _collect_backlog(
         self, first_page: list[dict[str, Any]], total: int, watermark: int
-    ) -> list[dict[str, Any]]:
+    ) -> list[dict[str, Any]] | None:
         """从 page1 起按需深翻页，收齐所有 published_at >= 水位线的条目（newest-first）。
 
         停止条件用 >= 而非 >：同一秒的帖可能跨页（page 末尾与下页开头同为水位线那一秒），
@@ -405,7 +495,7 @@ class DracalonFeedPlugin(Star):
         ):
             res = await self._fetch_page(page, FETCH_PAGE_SIZE)
             if res is None:
-                break  # 后续页拉取失败：用已收集的部分，下轮再补
+                return None
             more, total = res
             if not more:
                 break
@@ -482,16 +572,18 @@ class DracalonFeedPlugin(Star):
         """挑出尚未推送过的新帖：published_at 严格大于水位线，或恰好等于水位线
         但 item_key 不在 boundary（同秒未推过的）。"""
         boundary = set(self._state.get("boundary_keys", []) or [])
+        selected_keys: set[str] = set()
         out: list[dict[str, Any]] = []
         for it in items:
             ts = self._ts(it)
             if ts is None:
                 continue
             key = self._item_key(it)
-            if not key:
+            if not key or key in selected_keys:
                 continue
             if ts > watermark or (ts == watermark and key not in boundary):
                 out.append(it)
+                selected_keys.add(key)
         return out
 
     def _advance(self, item: dict[str, Any]) -> None:
@@ -524,23 +616,23 @@ class DracalonFeedPlugin(Star):
           → 统一流程恰好推这 1 条；其余（含同秒的）都在水位线下或 boundary 内被跳过。
         迁移场景（_migrate_silent）强制 mark_all：旧版本升级且此前已运行过时零重推。
         """
-        mode = "mark_all" if self._migrate_silent else str(
-            self.config.get("bootstrap_mode", "latest_one")
-        )
-        self._migrate_silent = False
-        self._state["bootstrap_done"] = True
-
-        if mode == "push_all":
-            self._state["watermark"] = 0
-            self._state["boundary_keys"] = []
-            return
-
         dated = sorted(
             (ts, k)
             for ts, k in ((self._ts(it), self._item_key(it)) for it in items)
             if ts is not None and k
         )
         if not dated:
+            return
+
+        mode = (
+            "mark_all"
+            if self._migrate_silent
+            else str(self.config.get("bootstrap_mode", "latest_one"))
+        )
+        self._migrate_silent = False
+        self._state["bootstrap_done"] = True
+
+        if mode == "push_all":
             self._state["watermark"] = 0
             self._state["boundary_keys"] = []
             return
@@ -614,7 +706,7 @@ class DracalonFeedPlugin(Star):
     # ------------------------------------------------------------------
     def _build_chain(self, item: dict[str, Any]) -> MessageChain:
         style = str(self.config.get("message_style", "rich"))
-        max_images = max(0, int(self.config.get("max_images_per_post", 3) or 0))
+        max_images = max(0, int(self.config.get("max_images_per_post", 1) or 0))
 
         chain: list = []
         community = str(item.get("community") or "社区")
@@ -625,6 +717,12 @@ class DracalonFeedPlugin(Star):
             author = item.get("author_name")
             if author:
                 chain.append(Comp.Plain(f"作者：{author}\n"))
+            published_ts = self._ts(item)
+            if published_ts:
+                published = time.strftime(
+                    "%Y-%m-%d %H:%M", time.localtime(published_ts)
+                )
+                chain.append(Comp.Plain(f"发布：{published}\n"))
 
         images = item.get("images") or []
         if not isinstance(images, list):
@@ -676,10 +774,18 @@ class DracalonFeedPlugin(Star):
 
         merged = _default_state()
         old_schema = int(data.get("schema", 1) or 1)
-        if old_schema >= STATE_SCHEMA and "watermark" in data:
+        if old_schema >= 2 and "watermark" in data:
             merged.update(data)
+            merged["schema"] = STATE_SCHEMA
             merged["boundary_keys"] = list(merged.get("boundary_keys") or [])
             merged["watermark"] = int(merged.get("watermark", 0) or 0)
+            merged["pending_deliveries"] = [
+                entry
+                for entry in (merged.get("pending_deliveries") or [])
+                if isinstance(entry, dict)
+                and isinstance(entry.get("item"), dict)
+                and isinstance(entry.get("targets"), list)
+            ]
             return merged
 
         # 旧版本（schema 1：基于 pushed_urls + 按天数 prune 去重）→ 迁移到 watermark。
@@ -714,6 +820,9 @@ class DracalonFeedPlugin(Star):
                 "last_error": str(self._state.get("last_error", "") or ""),
                 "bootstrap_done": bool(self._state.get("bootstrap_done", False)),
                 "was_quiet": bool(self._state.get("was_quiet", False)),
+                "pending_deliveries": list(
+                    self._state.get("pending_deliveries", []) or []
+                ),
             }
         try:
             # 文件 IO 是同步阻塞调用，丢到线程池避免阻塞 event loop

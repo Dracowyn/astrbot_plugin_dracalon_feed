@@ -2,7 +2,7 @@
   "api_base": {
     "description": "后端 API 根地址",
     "type": "string",
-    "default": "https://dracalon.com",
+    "default": "https://www.dracalon.com",
     "hint": "不含末尾斜杠。请求路径固定为 /api/homepage/feed"
   },
   "feed_key": {
@@ -25,8 +25,8 @@
   "max_images_per_post": {
     "description": "每条帖子最多发送图片数",
     "type": "int",
-    "default": 3,
-    "hint": "QQ 群单条消息图片过多容易触发风控，建议不超过 3"
+    "default": 1,
+    "hint": "默认只发首图，降低 QQ 风控和远程图片下载失败概率"
   },
   "targets": {
     "description": "推送目标（unified_msg_origin 列表）",
@@ -51,7 +51,7 @@
     "description": "启用夜间静默",
     "type": "bool",
     "default": false,
-    "hint": "开启后静默时段内不推送，积压到窗口结束再补推（不丢帖）"
+    "hint": "开启后静默时段内不推送；窗口结束时按补推上限发送最新帖子"
   },
   "quiet_hours_start": {
     "description": "静默开始小时(0-23)",
