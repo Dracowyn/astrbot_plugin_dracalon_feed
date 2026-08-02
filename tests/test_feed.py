@@ -115,6 +115,84 @@ async def test_poll_persists_only_the_failed_target(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_poll_batches_multiple_items_into_merged_messages(monkeypatch):
+    plugin = _plugin()
+    plugin.config = {
+        "targets": ["group"],
+        "merge_push_enabled": True,
+        "merge_push_threshold": 2,
+        "merge_push_batch_size": 2,
+    }
+    plugin._state["bootstrap_done"] = True
+    plugin._lock = asyncio.Lock()
+    plugin._save_state = AsyncMock()
+    items = [_item(f"post-{index}") for index in range(5)]
+    plugin._fetch_page = AsyncMock(return_value=(list(reversed(items)), len(items)))
+
+    class Context:
+        send_message = AsyncMock(return_value=True)
+
+    async def no_sleep(_delay):
+        return None
+
+    plugin.context = Context()
+    monkeypatch.setattr(feed.asyncio, "sleep", no_sleep)
+
+    await plugin._poll_once()
+
+    assert Context.send_message.await_count == 3
+    sent_chains = [call.args[1] for call in Context.send_message.await_args_list]
+    assert isinstance(sent_chains[0].chain[0], feed.Comp.Nodes)
+    assert isinstance(sent_chains[1].chain[0], feed.Comp.Nodes)
+    assert len(sent_chains[0].chain[0].nodes) == 2
+    assert len(sent_chains[1].chain[0].nodes) == 2
+    payload = await sent_chains[0].chain[0].to_dict()
+    assert len(payload["messages"]) == 2
+    assert payload["messages"][0]["data"]["nickname"] == "Dracalon 新帖"
+    assert isinstance(sent_chains[2].chain[0], feed.Comp.Plain)
+    assert plugin._state["pending_deliveries"] == []
+
+
+@pytest.mark.asyncio
+async def test_failed_merged_message_queues_every_item(monkeypatch):
+    plugin = _plugin()
+    plugin.config = {
+        "targets": ["missing"],
+        "merge_push_enabled": True,
+        "merge_push_threshold": 2,
+        "merge_push_batch_size": 5,
+    }
+    plugin._state["bootstrap_done"] = True
+    plugin._lock = asyncio.Lock()
+    plugin._save_state = AsyncMock()
+    items = [_item("post-a"), _item("post-b")]
+    plugin._fetch_page = AsyncMock(return_value=(list(reversed(items)), len(items)))
+
+    class Context:
+        send_message = AsyncMock(return_value=False)
+
+    async def no_sleep(_delay):
+        return None
+
+    plugin.context = Context()
+    monkeypatch.setattr(feed.asyncio, "sleep", no_sleep)
+    monkeypatch.setattr(feed.time, "time", lambda: 1_000)
+
+    await plugin._poll_once()
+
+    assert Context.send_message.await_count == 1
+    assert len(plugin._state["pending_deliveries"]) == 2
+    assert {
+        entry["item"]["item_key"]
+        for entry in plugin._state["pending_deliveries"]
+    } == {"post-a", "post-b"}
+    assert all(
+        entry["targets"] == ["missing"]
+        for entry in plugin._state["pending_deliveries"]
+    )
+
+
+@pytest.mark.asyncio
 async def test_poll_respects_pending_retry_time(monkeypatch):
     plugin = _plugin()
     plugin.config = {"targets": ["missing"]}

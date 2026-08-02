@@ -71,6 +71,24 @@
     "default": 5,
     "hint": "窗口重开时只推最新 N 条积压、其余标记已读防刷屏；0=不限制全部补推"
   },
+  "merge_push_enabled": {
+    "description": "启用多帖合并推送",
+    "type": "bool",
+    "default": true,
+    "hint": "同轮发现多条新帖时使用 QQ 合并转发，单条新帖保持普通富消息"
+  },
+  "merge_push_threshold": {
+    "description": "触发合并推送的最少帖子数",
+    "type": "int",
+    "default": 2,
+    "hint": "最小值为 2"
+  },
+  "merge_push_batch_size": {
+    "description": "每条合并消息最多包含的帖子数",
+    "type": "int",
+    "default": 5,
+    "hint": "范围 2-20；积压超过此数量时自动拆成多条合并消息"
+  },
   "message_style": {
     "description": "消息排版风格",
     "type": "string",

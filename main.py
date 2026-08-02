@@ -15,7 +15,7 @@ from astrbot.api.event import AstrMessageEvent, MessageChain, filter
 from astrbot.api.star import Context, Star, StarTools
 
 PLUGIN_NAME = "astrbot_plugin_dracalon_feed"
-USER_AGENT = "Dracalon-AstrBot-Feed/0.3"
+USER_AGENT = "Dracalon-AstrBot-Feed/0.4"
 INTER_TARGET_DELAY = 0.3
 INTER_ITEM_DELAY = 0.5
 RETRY_BASE_SECONDS = 120
@@ -182,10 +182,25 @@ class DracalonFeedPlugin(Star):
         else:
             quiet_desc = "未启用"
 
+        if self.config.get("merge_push_enabled", True):
+            merge_threshold = max(
+                2, int(self.config.get("merge_push_threshold", 2) or 2)
+            )
+            merge_batch_size = max(
+                merge_threshold,
+                min(20, int(self.config.get("merge_push_batch_size", 5) or 5)),
+            )
+            merge_desc = (
+                f"已启用（{merge_threshold} 条起，每批最多 {merge_batch_size} 条）"
+            )
+        else:
+            merge_desc = "未启用"
+
         lines = [
             "Dracalon 新帖订阅 · 当前状态",
             f"  推送开关：{'已启用' if enabled else '已暂停'}",
             f"  夜间静默：{quiet_desc}",
+            f"  合并推送：{merge_desc}",
             f"  上次轮询：{last_poll_str}",
             f"  上次错误：{last_error}",
             f"  推送水位线：{watermark_str}（早于此发布时间的帖子视为已推）",
@@ -442,20 +457,42 @@ class DracalonFeedPlugin(Star):
             self._state["pending_deliveries"] = pending
         await self._save_state()
 
-        for item in new_items:
-            failed, error = await self._deliver_to_targets(item, targets)
+        merge_enabled = bool(self.config.get("merge_push_enabled", True))
+        merge_threshold = max(2, int(self.config.get("merge_push_threshold", 2) or 2))
+        merge_batch_size = max(
+            merge_threshold,
+            min(20, int(self.config.get("merge_push_batch_size", 5) or 5)),
+        )
+        if merge_enabled and len(new_items) >= merge_threshold:
+            delivery_batches = [
+                new_items[offset : offset + merge_batch_size]
+                for offset in range(0, len(new_items), merge_batch_size)
+            ]
+        else:
+            delivery_batches = [[item] for item in new_items]
+
+        for batch in delivery_batches:
+            chain = (
+                self._build_merged_chain(batch)
+                if len(batch) >= merge_threshold
+                else self._build_chain(batch[0])
+            )
+            failed, error = await self._deliver_to_targets(
+                batch[-1], targets, chain=chain
+            )
             async with self._lock:
-                if failed:
-                    self._state.setdefault("pending_deliveries", []).append(
-                        {
-                            "item": item,
-                            "targets": failed,
-                            "attempts": 1,
-                            "next_retry_at": int(time.time()) + RETRY_BASE_SECONDS,
-                        }
-                    )
-                    delivery_error = error or delivery_error
-                self._advance(item)
+                for item in batch:
+                    if failed:
+                        self._state.setdefault("pending_deliveries", []).append(
+                            {
+                                "item": item,
+                                "targets": failed,
+                                "attempts": 1,
+                                "next_retry_at": int(time.time()) + RETRY_BASE_SECONDS,
+                            }
+                        )
+                        delivery_error = error or delivery_error
+                    self._advance(item)
             await self._save_state()
             await asyncio.sleep(INTER_ITEM_DELAY)
 
@@ -754,6 +791,25 @@ class DracalonFeedPlugin(Star):
             chain.append(Comp.Plain(f"\n{url}"))
 
         return MessageChain(chain=chain)
+
+    def _build_merged_chain(self, items: list[dict[str, Any]]) -> MessageChain:
+        """Build a QQ merged-forward message from multiple feed items.
+
+        Args:
+            items: Feed items in the order they should appear.
+
+        Returns:
+            A message chain containing one merged-forward component.
+        """
+        nodes = [
+            Comp.Node(
+                content=self._build_chain(item).chain,
+                name="Dracalon 新帖",
+                uin="0",
+            )
+            for item in items
+        ]
+        return MessageChain(chain=[Comp.Nodes(nodes)])
 
     # ------------------------------------------------------------------
     # state.json
