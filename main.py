@@ -1,18 +1,19 @@
 from __future__ import annotations
 
 import asyncio
-import hashlib
-import json
 import time
-from datetime import datetime, timezone
 from typing import Any
 
 import aiohttp
 
-import astrbot.api.message_components as Comp
+# 消息组件在 render 模块里构造；此处保留导入，供类型判定与测试断言引用
+import astrbot.api.message_components as Comp  # noqa: F401
 from astrbot.api import AstrBotConfig, logger
 from astrbot.api.event import AstrMessageEvent, MessageChain, filter
 from astrbot.api.star import Context, Star, StarTools
+
+from . import render, state
+from .state import item_key, item_ts
 
 PLUGIN_NAME = "astrbot_plugin_dracalon_feed"
 USER_AGENT = "Dracalon-AstrBot-Feed/0.4"
@@ -21,61 +22,11 @@ INTER_ITEM_DELAY = 0.5
 RETRY_BASE_SECONDS = 120
 RETRY_MAX_SECONDS = 3600
 
-STATE_SCHEMA = 3
 # 单页拉取条数（后端 FeedService::PAGE_SIZE_MAX = 50，取满）
 FETCH_PAGE_SIZE = 50
 # 深翻页页数上限：覆盖停机后的积压补推；超出说明积压超 PAGE_SIZE*MAX_PAGES 条，
 # 更老的新帖会被跳过（水位线直接跳到最新），仅在极端长时间停机时发生，会打日志。
 MAX_FETCH_PAGES = 5
-
-
-def _url_hash(url: str) -> str:
-    """本地 URL 哈希。仅作 item_key 回退（后端旧版本未输出 item_key 时）使用。"""
-    return hashlib.sha256(url.encode("utf-8")).hexdigest()[:16]
-
-
-def _friendly_umo(umo: str) -> str:
-    """把 unified_msg_origin 转成人类可读，识别失败原样返回。
-
-    示例：
-        aiocqhttp:GroupMessage:123456 → QQ 群 123456
-        aiocqhttp:FriendMessage:123456 → QQ 私聊 123456
-        qq_official:GroupMessage:xxxx → QQ 频道 xxxx
-    """
-    if not umo:
-        return "(未知会话)"
-    parts = umo.split(":", 2)
-    if len(parts) != 3:
-        return umo
-    platform, msg_type, session_id = parts
-    if platform == "aiocqhttp":
-        if msg_type == "GroupMessage":
-            return f"QQ 群 {session_id}"
-        if msg_type in ("FriendMessage", "PrivateMessage"):
-            return f"QQ 私聊 {session_id}"
-    if platform == "qq_official":
-        if msg_type == "GroupMessage":
-            return f"QQ 频道 {session_id}"
-        if msg_type == "DirectMessage":
-            return f"QQ 频道私信 {session_id}"
-    return umo
-
-
-def _default_state() -> dict[str, Any]:
-    return {
-        "schema": STATE_SCHEMA,
-        # watermark：已推帖的最大 published_at（epoch 秒，UTC）。
-        # boundary_keys：published_at 恰好 == watermark 且已处理（推送/标记）过的 item_key。
-        # 二者一起表达「已推进度」：published_at 严格大于 watermark 的一定是新帖；
-        # 恰好等于 watermark 的，靠 item_key 是否在 boundary 里区分（防同秒帖漏推/重推）。
-        "watermark": 0,
-        "boundary_keys": [],
-        "last_poll_at": 0,
-        "last_error": "",
-        "bootstrap_done": False,
-        "was_quiet": False,
-        "pending_deliveries": [],
-    }
 
 
 class DracalonFeedPlugin(Star):
@@ -89,7 +40,7 @@ class DracalonFeedPlugin(Star):
 
         state_dir = StarTools.get_data_dir(PLUGIN_NAME)
         self._state_path = state_dir / "state.json"
-        self._state = self._load_state()
+        self._state = state.load_state(self._state_path)
         # 旧版本（基于 pushed_urls 去重）升级而来且此前已运行过时，下一轮 bootstrap
         # 强制走 mark_all：把当前 feed 全部对齐为已读、零重推。非持久化、用一次即弃。
         self._migrate_silent = bool(self._state.pop("_needs_silent_migration", False))
@@ -107,7 +58,7 @@ class DracalonFeedPlugin(Star):
     async def bind(self, event: AstrMessageEvent):
         """把当前群加入新帖推送列表"""
         umo = event.unified_msg_origin
-        friendly = _friendly_umo(umo)
+        friendly = render.friendly_umo(umo)
         targets = list(self.config.get("targets", []) or [])
         if umo in targets:
             yield event.plain_result(f"当前 {friendly} 已经在推送列表里啦~")
@@ -121,7 +72,7 @@ class DracalonFeedPlugin(Star):
     async def unbind(self, event: AstrMessageEvent):
         """把当前群从推送列表移除"""
         umo = event.unified_msg_origin
-        friendly = _friendly_umo(umo)
+        friendly = render.friendly_umo(umo)
         targets = list(self.config.get("targets", []) or [])
         if umo not in targets:
             yield event.plain_result(f"当前 {friendly} 还未绑定推送")
@@ -143,7 +94,7 @@ class DracalonFeedPlugin(Star):
             )
             return
         lines = [f"共 {len(targets)} 个推送目标："]
-        lines.extend(f"  {idx}. {_friendly_umo(t)}" for idx, t in enumerate(targets, 1))
+        lines.extend(f"  {idx}. {render.friendly_umo(t)}" for idx, t in enumerate(targets, 1))
         yield event.plain_result("\n".join(lines))
 
     @filter.permission_type(filter.PermissionType.ADMIN)
@@ -228,7 +179,9 @@ class DracalonFeedPlugin(Star):
             yield event.plain_result("已成功访问后端，但当前没有可推送的帖子")
             return
         # 后端 sort=latest 已按发布时间倒序，items[0] 即最新
-        chain = self._build_chain(items[0])
+        chain = render.build_chain(
+            items[0], style=self._style(), max_images=self._max_images()
+        )
         failed, error = await self._deliver_to_targets(
             items[0], [event.unified_msg_origin], chain=chain
         )
@@ -308,6 +261,12 @@ class DracalonFeedPlugin(Star):
         except asyncio.CancelledError:
             return
 
+    def _style(self) -> str:
+        return str(self.config.get("message_style", "rich"))
+
+    def _max_images(self) -> int:
+        return max(0, int(self.config.get("max_images_per_post", 1) or 0))
+
     def _in_quiet_hours(self, now_struct: time.struct_time) -> bool:
         """当前是否处于夜间静默时段（本地时间，小时粒度，支持跨午夜）。"""
         if not self.config.get("quiet_hours_enabled", False):
@@ -338,7 +297,9 @@ class DracalonFeedPlugin(Star):
         Returns:
             A tuple containing failed targets and a concise error description.
         """
-        message = chain or self._build_chain(item)
+        message = chain or render.build_chain(
+            item, style=self._style(), max_images=self._max_images()
+        )
         failed: list[str] = []
         errors: list[str] = []
         for umo in dict.fromkeys(targets):
@@ -351,7 +312,7 @@ class DracalonFeedPlugin(Star):
                 errors.append(f"{umo}: {type(e).__name__}: {e}")
                 logger.error(
                     f"[{PLUGIN_NAME}] delivery to {umo} failed "
-                    f"for item {self._item_key(item) or '(unknown)'}: {e}"
+                    f"for item {item_key(item) or '(unknown)'}: {e}"
                 )
             await asyncio.sleep(INTER_TARGET_DELAY)
         return failed, "; ".join(errors[-3:])
@@ -382,9 +343,7 @@ class DracalonFeedPlugin(Star):
 
         new_items = self._select_new(collected, watermark)
         # 升序推送（旧→新），保证水位线单调推进、同秒帖按 item_key 稳定排序
-        new_items.sort(
-            key=lambda it: (self._ts(it) or 0, str(self._item_key(it) or ""))
-        )
+        new_items.sort(key=lambda it: (item_ts(it) or 0, str(item_key(it) or "")))
 
         # 夜间静默：窗口内不发送、不推进水位线（积压留到窗口结束自然补推，不丢帖）
         if self._in_quiet_hours(time.localtime()):
@@ -473,9 +432,13 @@ class DracalonFeedPlugin(Star):
 
         for batch in delivery_batches:
             chain = (
-                self._build_merged_chain(batch)
+                render.build_merged_chain(
+                    batch, style=self._style(), max_images=self._max_images()
+                )
                 if len(batch) >= merge_threshold
-                else self._build_chain(batch[0])
+                else render.build_chain(
+                    batch[0], style=self._style(), max_images=self._max_images()
+                )
             )
             failed, error = await self._deliver_to_targets(
                 batch[-1], targets, chain=chain
@@ -492,7 +455,7 @@ class DracalonFeedPlugin(Star):
                             }
                         )
                         delivery_error = error or delivery_error
-                    self._advance(item)
+                    state.advance_watermark(self._state, item)
             await self._save_state()
             await asyncio.sleep(INTER_ITEM_DELAY)
 
@@ -500,7 +463,7 @@ class DracalonFeedPlugin(Star):
         if dropped:
             async with self._lock:
                 for item in dropped:
-                    self._advance(item)
+                    state.advance_watermark(self._state, item)
 
         async with self._lock:
             self._state["was_quiet"] = False
@@ -522,7 +485,7 @@ class DracalonFeedPlugin(Star):
         collected = list(first_page)
         if not first_page or len(first_page) >= total:
             return collected
-        oldest = self._oldest_ts(first_page)
+        oldest = state.oldest_ts(first_page)
         page = 2
         while (
             oldest is not None
@@ -537,7 +500,7 @@ class DracalonFeedPlugin(Star):
             if not more:
                 break
             collected.extend(more)
-            oldest = self._oldest_ts(more)
+            oldest = state.oldest_ts(more)
             page += 1
         if oldest is not None and oldest >= watermark and len(collected) < total:
             logger.warning(
@@ -547,142 +510,30 @@ class DracalonFeedPlugin(Star):
         return collected
 
     # ------------------------------------------------------------------
-    # 水位线判定 / 推进
+    # 水位线判定 / 推进（纯逻辑在 state.py，这里只做「读配置 + 传状态」的适配）
     # ------------------------------------------------------------------
-    @staticmethod
-    def _oldest_ts(items: list[dict[str, Any]]) -> int | None:
-        """页内自末尾起第一条「有发布时间」条目的 ts。
-
-        无发布时间的条目在后端 latest 排序里沉底，深翻页判断「是否已翻过水位线」时
-        必须跳过它们，否则末条恰为无时间帖会让翻页提前停在 None 上。
-        """
-        for it in reversed(items):
-            ts = DracalonFeedPlugin._ts(it)
-            if ts is not None:
-                return ts
-        return None
-
-    @staticmethod
-    def _ts(item: dict[str, Any]) -> int | None:
-        """把 item.published_at（后端 gmdate('c') → ISO8601）解析成 epoch 秒。
-
-        无发布时间或无法解析时返回 None —— 这类条目不参与水位线判定，也不会被推送。
-        """
-        raw = item.get("published_at")
-        if not raw:
-            return None
-        # 防御：后端契约是 ISO8601 字符串，但万一改成数字 epoch 也能正确解析（而非静默丢帖）
-        if isinstance(raw, bool):
-            return None
-        if isinstance(raw, (int, float)):
-            ts = int(raw)
-            return ts if ts > 0 else None
-        s = str(raw).strip()
-        if not s:
-            return None
-        if s.endswith("Z"):
-            s = s[:-1] + "+00:00"
-        try:
-            dt = datetime.fromisoformat(s)
-        except ValueError:
-            return None
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=timezone.utc)
-        return int(dt.timestamp())
-
-    @staticmethod
-    def _item_key(item: dict[str, Any]) -> str | None:
-        """稳定去重键。优先用后端下发的 item_key = sha256(normalize(url))；
-        后端旧版本未输出时回退到本地 raw-url 哈希（仅用于同秒 tie-break，可接受）。
-        """
-        k = item.get("item_key")
-        if isinstance(k, str) and k:
-            return k
-        url = item.get("url")
-        if url:
-            return _url_hash(str(url))
-        return None
-
     def _select_new(
         self, items: list[dict[str, Any]], watermark: int
     ) -> list[dict[str, Any]]:
-        """挑出尚未推送过的新帖：published_at 严格大于水位线，或恰好等于水位线
-        但 item_key 不在 boundary（同秒未推过的）。"""
-        boundary = set(self._state.get("boundary_keys", []) or [])
-        selected_keys: set[str] = set()
-        out: list[dict[str, Any]] = []
-        for it in items:
-            ts = self._ts(it)
-            if ts is None:
-                continue
-            key = self._item_key(it)
-            if not key or key in selected_keys:
-                continue
-            if ts > watermark or (ts == watermark and key not in boundary):
-                out.append(it)
-                selected_keys.add(key)
-        return out
-
-    def _advance(self, item: dict[str, Any]) -> None:
-        """把一条已处理（推送或标记已读）的帖子并入水位线。
-
-        必须按 published_at 升序调用，水位线才单调推进。同秒帖累积进 boundary，
-        水位线一旦前进 boundary 就清空换新 —— 因此 boundary 至多保留同一秒的条目数，
-        不会无限增长，无需额外清理（这正是替代旧 pushed_urls + 按天数 prune 的关键）。
-        """
-        ts = self._ts(item) or 0
-        key = self._item_key(item)
-        if not key:
-            return
-        wm = int(self._state.get("watermark", 0) or 0)
-        if ts > wm:
-            self._state["watermark"] = ts
-            self._state["boundary_keys"] = [key]
-        elif ts == wm:
-            boundary = self._state.setdefault("boundary_keys", [])
-            if key not in boundary:
-                boundary.append(key)
-        # ts < wm：更旧的条目，已在水位线之下，忽略
+        """挑出尚未推送过的新帖（boundary 从当前状态取）。"""
+        return state.select_new(
+            items, watermark, set(self._state.get("boundary_keys", []) or [])
+        )
 
     def _apply_bootstrap(self, items: list[dict[str, Any]]) -> None:
-        """首次启动设定水位线基线（不直接推送，推送交给统一流程）。
+        """首次启动设定水位线基线。
 
-        - push_all：水位线归零，统一流程随后把当前全部帖子推一遍（慎用）。
-        - mark_all：水位线设到最新帖、boundary 含最新秒全部 key → 当前帖全标记已读、0 推送。
-        - latest_one（默认）：水位线设到最新帖，但 boundary 排除「最新那一条」的 key
-          → 统一流程恰好推这 1 条；其余（含同秒的）都在水位线下或 boundary 内被跳过。
         迁移场景（_migrate_silent）强制 mark_all：旧版本升级且此前已运行过时零重推。
+        基线一旦落定即复位 _migrate_silent，避免下轮再走一次静默对齐。
         """
-        dated = sorted(
-            (ts, k)
-            for ts, k in ((self._ts(it), self._item_key(it)) for it in items)
-            if ts is not None and k
-        )
-        if not dated:
-            return
-
         mode = (
             "mark_all"
             if self._migrate_silent
             else str(self.config.get("bootstrap_mode", "latest_one"))
         )
-        self._migrate_silent = False
-        self._state["bootstrap_done"] = True
-
-        if mode == "push_all":
-            self._state["watermark"] = 0
-            self._state["boundary_keys"] = []
-            return
-
-        newest_ts, newest_key = dated[-1]
-        keys_at_newest = [k for ts, k in dated if ts == newest_ts]
-        self._state["watermark"] = newest_ts
-        if mode == "mark_all":
-            self._state["boundary_keys"] = keys_at_newest
-        else:  # latest_one：放过最新 1 条
-            self._state["boundary_keys"] = [
-                k for k in keys_at_newest if k != newest_key
-            ]
+        state.apply_bootstrap(self._state, items, mode)
+        if self._state.get("bootstrap_done"):
+            self._migrate_silent = False
 
     # ------------------------------------------------------------------
     # 后端拉取
@@ -739,157 +590,13 @@ class DracalonFeedPlugin(Star):
         return items, total
 
     # ------------------------------------------------------------------
-    # MessageChain 构造
-    # ------------------------------------------------------------------
-    def _build_chain(self, item: dict[str, Any]) -> MessageChain:
-        style = str(self.config.get("message_style", "rich"))
-        max_images = max(0, int(self.config.get("max_images_per_post", 1) or 0))
-
-        chain: list = []
-        community = str(item.get("community") or "社区")
-        title = str(item.get("title") or "(无标题)")
-        chain.append(Comp.Plain(f"【{community}】{title}\n"))
-
-        if style == "rich":
-            author = item.get("author_name")
-            if author:
-                chain.append(Comp.Plain(f"作者：{author}\n"))
-            published_ts = self._ts(item)
-            if published_ts:
-                published = time.strftime(
-                    "%Y-%m-%d %H:%M", time.localtime(published_ts)
-                )
-                chain.append(Comp.Plain(f"发布：{published}\n"))
-
-        images = item.get("images") or []
-        if not isinstance(images, list):
-            images = []
-        if not images and item.get("cover_image"):
-            images = [item["cover_image"]]
-        for img in images[:max_images]:
-            if isinstance(img, str) and img.startswith(("http://", "https://")):
-                try:
-                    chain.append(Comp.Image.fromURL(img))
-                except Exception as e:
-                    logger.warning(f"[{PLUGIN_NAME}] image url invalid {img}: {e}")
-
-        if style == "rich":
-            stats: list[str] = []
-            for key, label in (
-                ("reply_count", "回复"),
-                ("like_count", "点赞"),
-                ("view_count", "浏览"),
-            ):
-                v = item.get(key)
-                if isinstance(v, (int, float)) and v > 0:
-                    stats.append(f"{label} {int(v)}")
-            if stats:
-                chain.append(Comp.Plain("\n" + " · ".join(stats)))
-
-        url = item.get("url")
-        if url:
-            chain.append(Comp.Plain(f"\n{url}"))
-
-        return MessageChain(chain=chain)
-
-    def _build_merged_chain(self, items: list[dict[str, Any]]) -> MessageChain:
-        """Build a QQ merged-forward message from multiple feed items.
-
-        Args:
-            items: Feed items in the order they should appear.
-
-        Returns:
-            A message chain containing one merged-forward component.
-        """
-        nodes = [
-            Comp.Node(
-                content=self._build_chain(item).chain,
-                name="Dracalon 新帖",
-                uin="0",
-            )
-            for item in items
-        ]
-        return MessageChain(chain=[Comp.Nodes(nodes)])
-
-    # ------------------------------------------------------------------
     # state.json
     # ------------------------------------------------------------------
-    def _load_state(self) -> dict[str, Any]:
-        if not self._state_path.exists():
-            return _default_state()
-        try:
-            raw = self._state_path.read_text(encoding="utf-8")
-            data = json.loads(raw)
-            if not isinstance(data, dict):
-                raise ValueError("state.json is not an object")
-        except Exception as e:
-            logger.error(
-                f"[{PLUGIN_NAME}] state.json corrupted ({e}), reset to default"
-            )
-            return _default_state()
-
-        merged = _default_state()
-        old_schema = int(data.get("schema", 1) or 1)
-        if old_schema >= 2 and "watermark" in data:
-            merged.update(data)
-            merged["schema"] = STATE_SCHEMA
-            merged["boundary_keys"] = list(merged.get("boundary_keys") or [])
-            merged["watermark"] = int(merged.get("watermark", 0) or 0)
-            merged["pending_deliveries"] = [
-                entry
-                for entry in (merged.get("pending_deliveries") or [])
-                if isinstance(entry, dict)
-                and isinstance(entry.get("item"), dict)
-                and isinstance(entry.get("targets"), list)
-            ]
-            return merged
-
-        # 旧版本（schema 1：基于 pushed_urls + 按天数 prune 去重）→ 迁移到 watermark。
-        # 丢弃 pushed_urls；若此前已 bootstrap 过（在线上跑过），标记下轮静默 mark_all、
-        # 把当前 feed 全部对齐已读，升级零重推。仅缺时间戳的极少数帖会在迁移窗口被跳过。
-        had_run = bool(data.get("bootstrap_done")) or bool(data.get("pushed_urls"))
-        merged.update(
-            {
-                k: v
-                for k, v in data.items()
-                if k in ("last_poll_at", "last_error", "was_quiet")
-            }
-        )
-        merged["schema"] = STATE_SCHEMA
-        merged["watermark"] = 0
-        merged["boundary_keys"] = []
-        merged["bootstrap_done"] = False
-        merged["_needs_silent_migration"] = had_run
-        logger.info(
-            f"[{PLUGIN_NAME}] migrated state schema {old_schema} → {STATE_SCHEMA}"
-            f"{'（静默 mark_all 对齐，零重推）' if had_run else ''}"
-        )
-        return merged
-
     async def _save_state(self) -> None:
         async with self._lock:
-            snapshot = {
-                "schema": STATE_SCHEMA,
-                "watermark": int(self._state.get("watermark", 0) or 0),
-                "boundary_keys": list(self._state.get("boundary_keys", []) or []),
-                "last_poll_at": int(self._state.get("last_poll_at", 0) or 0),
-                "last_error": str(self._state.get("last_error", "") or ""),
-                "bootstrap_done": bool(self._state.get("bootstrap_done", False)),
-                "was_quiet": bool(self._state.get("was_quiet", False)),
-                "pending_deliveries": list(
-                    self._state.get("pending_deliveries", []) or []
-                ),
-            }
+            snapshot = state.snapshot_state(self._state)
         try:
             # 文件 IO 是同步阻塞调用，丢到线程池避免阻塞 event loop
-            await asyncio.to_thread(self._write_state_file, snapshot)
+            await asyncio.to_thread(state.write_state_file, self._state_path, snapshot)
         except Exception as e:
             logger.error(f"[{PLUGIN_NAME}] save state failed: {e}")
-
-    def _write_state_file(self, snapshot: dict[str, Any]) -> None:
-        tmp_path = self._state_path.with_suffix(".json.tmp")
-        tmp_path.write_text(
-            json.dumps(snapshot, ensure_ascii=False, indent=2),
-            encoding="utf-8",
-        )
-        tmp_path.replace(self._state_path)

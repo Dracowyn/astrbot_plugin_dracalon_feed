@@ -1,27 +1,19 @@
 from __future__ import annotations
 
 import asyncio
-import importlib.util
 import json
-import sys
-from pathlib import Path
 from unittest.mock import AsyncMock
 
 import pytest
 
-PLUGIN_ROOT = Path(__file__).resolve().parents[1]
-MODULE_NAME = "astrbot_plugin_dracalon_feed_test"
-SPEC = importlib.util.spec_from_file_location(MODULE_NAME, PLUGIN_ROOT / "main.py")
-assert SPEC and SPEC.loader
-feed = importlib.util.module_from_spec(SPEC)
-sys.modules[MODULE_NAME] = feed
-SPEC.loader.exec_module(feed)
+from astrbot_plugin_dracalon_feed import main as feed
+from astrbot_plugin_dracalon_feed import state as feed_state
 
 
 def _plugin() -> feed.DracalonFeedPlugin:
     plugin = object.__new__(feed.DracalonFeedPlugin)
     plugin.config = {}
-    plugin._state = feed._default_state()
+    plugin._state = feed_state.default_state()
     plugin._migrate_silent = False
     return plugin
 
@@ -102,7 +94,7 @@ async def test_poll_persists_only_the_failed_target(monkeypatch):
 
     await plugin._poll_once()
 
-    assert plugin._state["watermark"] == feed.DracalonFeedPlugin._ts(_item("post"))
+    assert plugin._state["watermark"] == feed_state.item_ts(_item("post"))
     assert plugin._state["pending_deliveries"] == [
         {
             "item": _item("post"),
@@ -240,12 +232,9 @@ def test_schema_two_state_migrates_without_resetting_watermark(tmp_path):
         ),
         encoding="utf-8",
     )
-    plugin = object.__new__(feed.DracalonFeedPlugin)
-    plugin._state_path = state_path
+    state = feed_state.load_state(state_path)
 
-    state = plugin._load_state()
-
-    assert state["schema"] == feed.STATE_SCHEMA
+    assert state["schema"] == feed_state.STATE_SCHEMA
     assert state["watermark"] == 123
     assert state["boundary_keys"] == ["kept"]
     assert state["pending_deliveries"] == []
