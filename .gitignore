@@ -7,3 +7,6 @@ venv/
 .vscode/
 .DS_Store
 *.log
+
+# 设计文档与实现计划仅保留在本地
+docs/
