@@ -16,6 +16,7 @@ def _plugin() -> feed.DracalonFeedPlugin:
     plugin._state = feed_state.default_state()
     plugin._migrate_silent = False
     plugin._provider_warn_at = 0
+    plugin._flush_lock = asyncio.Lock()
     return plugin
 
 
@@ -608,3 +609,38 @@ async def test_filtered_recent_is_capped(monkeypatch):
 
     assert len(plugin._state["filtered_recent"]) == 10
     assert plugin._state["filtered_recent"][0]["reason"] == "广告"
+
+
+@pytest.mark.asyncio
+async def test_concurrent_flush_sends_batch_only_once(monkeypatch):
+    """/dracalon_feed flush 与轮询自动结算撞在一起时不能重复推送。
+
+    两者跑在不同的 task 里，_flush_digest 里每个 await 都是让出点，
+    没有互斥就会各自读到同一份缓冲区、各自投递一遍。
+    """
+    plugin = _plugin()
+    plugin.config = {"targets": ["group"], "review_enabled": False}
+    plugin._lock = asyncio.Lock()
+    plugin._save_state = AsyncMock()
+    plugin._review_provider = lambda: None
+    plugin._state["digest_buffer"] = [_item("post")]
+
+    class Context:
+        send_message = AsyncMock(return_value=True)
+
+    real_sleep = asyncio.sleep
+
+    async def yielding_sleep(_delay):
+        await real_sleep(0)
+
+    plugin.context = Context()
+    monkeypatch.setattr(feed.asyncio, "sleep", yielding_sleep)
+
+    first, second = await asyncio.gather(
+        plugin._flush_digest(["group"]),
+        plugin._flush_digest(["group"]),
+    )
+
+    assert Context.send_message.await_count == 1
+    assert sorted([first[0], second[0]]) == [0, 1]
+    assert plugin._state["digest_buffer"] == []

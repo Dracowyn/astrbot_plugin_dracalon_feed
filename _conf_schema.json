@@ -121,7 +121,7 @@
   },
   "review_extra_rules": {
     "description": "追加的审查规则",
-    "type": "string",
+    "type": "text",
     "default": "",
     "hint": "拼在内置规则之后。用 /dracalon_feed filtered 看误杀情况来调这里"
   },

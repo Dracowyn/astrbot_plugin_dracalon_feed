@@ -187,7 +187,7 @@ async def review_batch(
     *,
     max_images: int,
 ) -> ReviewOutcome:
-    """审查一批帖子。图片段在 Task 6 接入。"""
+    """审查一批帖子：先文本批量判去留，再对保留下来且带图的帖逐帖复审配图。"""
     if not items:
         return ReviewOutcome(False, [], [], False)
     if not settings.enabled:

@@ -39,6 +39,9 @@ class DracalonFeedPlugin(Star):
         self._session: aiohttp.ClientSession | None = None
         self._poll_task: asyncio.Task | None = None
         self._lock = asyncio.Lock()
+        # 结算是长流程（审查 + 逐批投递，中间全是让出点），轮询与 /dracalon_feed flush
+        # 跑在不同 task 里，没有这把锁两者会各读一份缓冲区、把同一批帖推两遍。
+        self._flush_lock = asyncio.Lock()
 
         state_dir = StarTools.get_data_dir(PLUGIN_NAME)
         self._state_path = state_dir / "state.json"
@@ -433,6 +436,9 @@ class DracalonFeedPlugin(Star):
     async def _flush_digest(self, targets: list[str]) -> tuple[int, int, bool]:
         """结算缓冲区：审查后取出保留的帖子，投递后清空。
 
+        全程串行化 —— 轮询自动结算与 /dracalon_feed flush 并发时，后到者会等前者
+        清空缓冲区后再进入，读到空缓冲直接返回 (0, 0, False)，不会重复推送。
+
         Args:
             targets: 已去重的推送目标列表。
 
@@ -440,6 +446,11 @@ class DracalonFeedPlugin(Star):
             (已投递帖数, 被审查丢弃帖数, 是否推迟到下轮)。审查失败时缓冲区原样保留，
             退避到期后下轮重审；连续失败达上限后整批放行，绝不无限扣留。
         """
+        async with self._flush_lock:
+            return await self._flush_digest_locked(targets)
+
+    async def _flush_digest_locked(self, targets: list[str]) -> tuple[int, int, bool]:
+        """_flush_digest 的实际流程，调用方须已持有 _flush_lock。"""
         async with self._lock:
             buffer = list(self._state.get("digest_buffer") or [])
             was_quiet = bool(self._state.get("was_quiet", False))

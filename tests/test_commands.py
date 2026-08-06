@@ -27,6 +27,7 @@ def _plugin() -> feed.DracalonFeedPlugin:
     plugin._migrate_silent = False
     plugin._provider_warn_at = 0
     plugin._lock = asyncio.Lock()
+    plugin._flush_lock = asyncio.Lock()
     plugin._save_state = AsyncMock()
     return plugin
 
