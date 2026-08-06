@@ -15,7 +15,7 @@ from typing import Any
 from astrbot.api import logger
 
 PLUGIN_NAME = "astrbot_plugin_dracalon_feed"
-STATE_SCHEMA = 3
+STATE_SCHEMA = 4
 
 
 def url_hash(url: str) -> str:
@@ -37,6 +37,15 @@ def default_state() -> dict[str, Any]:
         "bootstrap_done": False,
         "was_quiet": False,
         "pending_deliveries": [],
+        # digest_buffer：已收录但尚未结算投递的帖子。水位线在收录时就推进，
+        # 因此「已收录未投递」的帖只存在于这里，与水位线在同一次落盘中写入。
+        "digest_buffer": [],
+        "last_flush_at": 0,
+        # review_attempts / review_retry_at：审查连续失败次数与退避到期时间。
+        "review_attempts": 0,
+        "review_retry_at": 0,
+        # filtered_recent：最近被审查毙掉的帖，供 /dracalon_feed filtered 调 prompt 用。
+        "filtered_recent": [],
     }
 
 
@@ -201,6 +210,19 @@ def load_state(path: Path) -> dict[str, Any]:
             and isinstance(entry.get("item"), dict)
             and isinstance(entry.get("targets"), list)
         ]
+        merged["digest_buffer"] = [
+            entry
+            for entry in (merged.get("digest_buffer") or [])
+            if isinstance(entry, dict) and entry.get("url")
+        ]
+        merged["filtered_recent"] = [
+            entry
+            for entry in (merged.get("filtered_recent") or [])
+            if isinstance(entry, dict)
+        ]
+        merged["last_flush_at"] = int(merged.get("last_flush_at", 0) or 0)
+        merged["review_attempts"] = int(merged.get("review_attempts", 0) or 0)
+        merged["review_retry_at"] = int(merged.get("review_retry_at", 0) or 0)
         return merged
 
     # 旧版本（schema 1：基于 pushed_urls + 按天数 prune 去重）→ 迁移到 watermark。
@@ -237,6 +259,11 @@ def snapshot_state(st: dict[str, Any]) -> dict[str, Any]:
         "bootstrap_done": bool(st.get("bootstrap_done", False)),
         "was_quiet": bool(st.get("was_quiet", False)),
         "pending_deliveries": list(st.get("pending_deliveries", []) or []),
+        "digest_buffer": list(st.get("digest_buffer", []) or []),
+        "last_flush_at": int(st.get("last_flush_at", 0) or 0),
+        "review_attempts": int(st.get("review_attempts", 0) or 0),
+        "review_retry_at": int(st.get("review_retry_at", 0) or 0),
+        "filtered_recent": list(st.get("filtered_recent", []) or []),
     }
 
 
