@@ -19,7 +19,9 @@ class DigestSettings:
     max_items: int
 
 
-def _clamped_int(config: Mapping[str, Any], key: str, *, default: int, floor: int) -> int:
+def _clamped_int(
+    config: Mapping[str, Any], key: str, *, default: int, floor: int
+) -> int:
     """读配置整数并夹到下限。
 
     缺键或值为 None 时取默认值；显式填 0 视为「填小了」而非「没填」，夹到 floor

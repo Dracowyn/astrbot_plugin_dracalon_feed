@@ -1,7 +1,7 @@
 name: astrbot_plugin_dracalon_feed
-desc: 订阅 Dracalon 首页 community_hot feed（Discuz + QQ 频道），新帖推送到 QQ 群。
+desc: 订阅 Dracalon 首页 community_hot feed（Discuz + QQ 频道），按窗口合并并经 AI 审查后推送到 QQ 群。
 author: dracowyn
-version: 0.4.0
+version: 0.5.0
 short_desc: Dracalon 社区新帖订阅推送
 repo: https://github.com/Dracowyn/astrbot_plugin_dracalon_feed
 support_platforms:

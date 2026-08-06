@@ -75,7 +75,7 @@
     "description": "启用多帖合并推送",
     "type": "bool",
     "default": true,
-    "hint": "同轮发现多条新帖时使用 QQ 合并转发，单条新帖保持普通富消息"
+    "hint": "结算时多条帖子使用 QQ 合并转发，单条保持普通富消息"
   },
   "merge_push_threshold": {
     "description": "触发合并推送的最少帖子数",
@@ -88,6 +88,65 @@
     "type": "int",
     "default": 5,
     "hint": "范围 2-20；积压超过此数量时自动拆成多条合并消息"
+  },
+  "digest_enabled": {
+    "description": "启用窗口合并推送",
+    "type": "bool",
+    "default": true,
+    "hint": "开启后新帖先进缓冲区，攒够时长或条数再一次性合并推送；关闭则每轮发现即推"
+  },
+  "digest_interval_seconds": {
+    "description": "合并推送窗口（秒）",
+    "type": "int",
+    "default": 1800,
+    "hint": "距上次结算超过此时长就推一批。最小 60；实际精度受轮询间隔限制"
+  },
+  "digest_max_items": {
+    "description": "提前结算的帖子数",
+    "type": "int",
+    "default": 10,
+    "hint": "缓冲区攒够这么多条时立即推送，不等窗口到期"
+  },
+  "review_enabled": {
+    "description": "启用 AI 内容审查",
+    "type": "bool",
+    "default": true,
+    "hint": "推送前让 LLM 判定每条帖子是否值得推，剔除灌水/测试/广告等内容"
+  },
+  "review_provider_id": {
+    "description": "审查使用的 Provider ID",
+    "type": "string",
+    "default": "",
+    "hint": "留空则用当前默认对话模型。建议指定一个便宜的模型"
+  },
+  "review_extra_rules": {
+    "description": "追加的审查规则",
+    "type": "string",
+    "default": "",
+    "hint": "拼在内置规则之后。用 /dracalon_feed filtered 看误杀情况来调这里"
+  },
+  "review_max_attempts": {
+    "description": "审查失败重试次数",
+    "type": "int",
+    "default": 3,
+    "hint": "连续失败达此次数后整批放行，避免模型故障导致静默丢帖"
+  },
+  "review_timeout_seconds": {
+    "description": "单次审查调用超时（秒）",
+    "type": "int",
+    "default": 30
+  },
+  "image_review_enabled": {
+    "description": "启用配图审查",
+    "type": "bool",
+    "default": true,
+    "hint": "对带图的帖逐条做多模态审查，图不合适则整帖不推。纯文本模型请关闭"
+  },
+  "image_review_max_per_batch": {
+    "description": "单批最多审查几帖配图",
+    "type": "int",
+    "default": 10,
+    "hint": "超出的帖跳过图片审查照常推送，并在日志告警"
   },
   "message_style": {
     "description": "消息排版风格",

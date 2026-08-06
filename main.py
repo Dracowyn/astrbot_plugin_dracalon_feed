@@ -12,11 +12,11 @@ from astrbot.api import AstrBotConfig, logger
 from astrbot.api.event import AstrMessageEvent, MessageChain, filter
 from astrbot.api.star import Context, Star, StarTools
 
-from . import digest, render, review, state
+from . import digest, render, review, state, status_text
 from .state import item_key, item_ts
 
 PLUGIN_NAME = "astrbot_plugin_dracalon_feed"
-USER_AGENT = "Dracalon-AstrBot-Feed/0.4"
+USER_AGENT = "Dracalon-AstrBot-Feed/0.5"
 INTER_TARGET_DELAY = 0.3
 INTER_ITEM_DELAY = 0.5
 RETRY_BASE_SECONDS = 120
@@ -97,71 +97,26 @@ class DracalonFeedPlugin(Star):
             )
             return
         lines = [f"共 {len(targets)} 个推送目标："]
-        lines.extend(f"  {idx}. {render.friendly_umo(t)}" for idx, t in enumerate(targets, 1))
+        lines.extend(
+            f"  {idx}. {render.friendly_umo(t)}" for idx, t in enumerate(targets, 1)
+        )
         yield event.plain_result("\n".join(lines))
 
     @filter.permission_type(filter.PermissionType.ADMIN)
     @dracalon_feed.command("status")
     async def status(self, event: AstrMessageEvent):
         """查看推送系统运行状态"""
-        last_poll_at = int(self._state.get("last_poll_at", 0) or 0)
-        last_poll_str = (
-            time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(last_poll_at))
-            if last_poll_at
-            else "尚未轮询过"
+        review_settings = review.settings_from_config(self.config)
+        # 未启用审查时不取 provider，避免触发无谓的「未配置」告警日志节流判断
+        provider_available = (
+            self._review_provider() is not None if review_settings.enabled else False
         )
-        enabled = bool(self.config.get("enabled", True))
-        targets = self.config.get("targets", []) or []
-        watermark = int(self._state.get("watermark", 0) or 0)
-        watermark_str = (
-            time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(watermark))
-            if watermark
-            else "尚未推送"
+        lines = status_text.build_lines(
+            self.config,
+            self._state,
+            in_quiet_hours=self._in_quiet_hours(time.localtime()),
+            review_provider_available=provider_available,
         )
-        last_error = self._state.get("last_error") or "无"
-        bootstrap_done = bool(self._state.get("bootstrap_done", False))
-        pending_count = sum(
-            len(entry.get("targets", []))
-            for entry in self._state.get("pending_deliveries", [])
-            if isinstance(entry, dict)
-        )
-
-        if self.config.get("quiet_hours_enabled", False):
-            qs = int(self.config.get("quiet_hours_start", 0) or 0) % 24
-            qe = int(self.config.get("quiet_hours_end", 0) or 0) % 24
-            in_quiet = self._in_quiet_hours(time.localtime())
-            quiet_desc = (
-                f"{qs:02d}:00–{qe:02d}:00（{'静默中' if in_quiet else '非静默'}）"
-            )
-        else:
-            quiet_desc = "未启用"
-
-        if self.config.get("merge_push_enabled", True):
-            merge_threshold = max(
-                2, int(self.config.get("merge_push_threshold", 2) or 2)
-            )
-            merge_batch_size = max(
-                merge_threshold,
-                min(20, int(self.config.get("merge_push_batch_size", 5) or 5)),
-            )
-            merge_desc = (
-                f"已启用（{merge_threshold} 条起，每批最多 {merge_batch_size} 条）"
-            )
-        else:
-            merge_desc = "未启用"
-
-        lines = [
-            "Dracalon 新帖订阅 · 当前状态",
-            f"  推送开关：{'已启用' if enabled else '已暂停'}",
-            f"  夜间静默：{quiet_desc}",
-            f"  合并推送：{merge_desc}",
-            f"  上次轮询：{last_poll_str}",
-            f"  上次错误：{last_error}",
-            f"  推送水位线：{watermark_str}（早于此发布时间的帖子视为已推）",
-            f"  绑定目标数：{len(targets)}",
-            f"  待重试投递数：{pending_count}",
-            f"  首次启动初始化：{'已完成' if bootstrap_done else '尚未完成'}",
-        ]
         yield event.plain_result("\n".join(lines))
 
     @filter.permission_type(filter.PermissionType.ADMIN)
@@ -208,6 +163,45 @@ class DracalonFeedPlugin(Star):
         self.config["enabled"] = True
         self.config.save_config()
         yield event.plain_result("已恢复推送")
+
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @dracalon_feed.command("flush")
+    async def flush(self, event: AstrMessageEvent):
+        """立即结算缓冲区并推送（不等窗口到期）"""
+        if not (self._state.get("digest_buffer") or []):
+            yield event.plain_result("缓冲区里没有待推送的帖子")
+            return
+        async with self._lock:
+            self._state["review_retry_at"] = 0
+        targets = list(dict.fromkeys(self.config.get("targets", []) or []))
+        sent, dropped, deferred = await self._flush_digest(targets)
+        if deferred:
+            yield event.plain_result("AI 审查暂时不可用，这批帖子留到下次结算重试")
+            return
+        yield event.plain_result(f"已结算：推送 {sent} 条，审查丢弃 {dropped} 条")
+
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @dracalon_feed.command("filtered")
+    async def filtered(self, event: AstrMessageEvent):
+        """查看最近被 AI 审查丢弃的帖子"""
+        entries = list(self._state.get("filtered_recent") or [])
+        if not entries:
+            yield event.plain_result("还没有被审查丢弃的帖子")
+            return
+        source_label = {"text": "文本", "image": "配图"}
+        lines = [f"最近 {len(entries)} 条被丢弃的帖子："]
+        for idx, entry in enumerate(entries, 1):
+            at = int(entry.get("at", 0) or 0)
+            when = (
+                time.strftime("%m-%d %H:%M", time.localtime(at)) if at else "未知时间"
+            )
+            label = source_label.get(str(entry.get("source", "")), "未知")
+            lines.append(
+                f"  {idx}. [{when}·{label}] {entry.get('title') or '(无标题)'}\n"
+                f"     理由：{entry.get('reason') or '(未给出)'}\n"
+                f"     {entry.get('url') or ''}"
+            )
+        yield event.plain_result("\n".join(lines))
 
     # ------------------------------------------------------------------
     # 生命周期
