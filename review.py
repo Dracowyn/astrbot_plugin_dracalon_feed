@@ -214,4 +214,99 @@ async def review_batch(
             dropped.append({"item": item, "reason": verdict.reason, "source": "text"})
         else:
             kept.append(item)
-    return ReviewOutcome(False, kept, dropped, False)
+
+    if not settings.image_enabled:
+        return ReviewOutcome(False, kept, dropped, False)
+    return await _review_images(provider, kept, dropped, settings, max_images)
+
+
+def images_for_item(item: dict[str, Any], max_images: int) -> list[str]:
+    """取该帖真正会被发出去的图，取图逻辑与 render.build_chain 保持一致。"""
+    if max_images <= 0:
+        return []
+    images = item.get("images")
+    if not isinstance(images, list):
+        images = []
+    urls = [
+        img
+        for img in images
+        if isinstance(img, str) and img.startswith(("http://", "https://"))
+    ]
+    if not urls:
+        cover = item.get("cover_image")
+        if isinstance(cover, str) and cover.startswith(("http://", "https://")):
+            urls = [cover]
+    return urls[:max_images]
+
+
+def parse_image_verdict(raw: str) -> Verdict | None:
+    """解析图片审查返回，不可解析时返回 None（该帖 fail-open 保留）。"""
+    try:
+        data = json.loads(slice_json(strip_json_fence(raw), "{", "}"))
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    return Verdict(
+        keep=bool(data.get("keep", True)),
+        reason=str(data.get("reason") or ""),
+        source="image",
+    )
+
+
+async def _review_images(
+    provider: Any,
+    kept: list[dict[str, Any]],
+    dropped: list[dict[str, Any]],
+    settings: ReviewSettings,
+    max_images: int,
+) -> ReviewOutcome:
+    """逐帖复审配图。图不过则丢整帖；单帖失败保留该帖，过半失败视为 provider 异常。"""
+    system_prompt = (
+        f"{IMAGE_RULES}\n\n补充规则：\n{settings.extra_rules}"
+        if settings.extra_rules
+        else IMAGE_RULES
+    )
+    survivors: list[dict[str, Any]] = []
+    attempted = 0
+    failures = 0
+    skipped = 0
+    for item in kept:
+        urls = images_for_item(item, max_images)
+        if not urls:
+            survivors.append(item)
+            continue
+        if attempted >= settings.image_max_per_batch:
+            skipped += 1
+            survivors.append(item)
+            continue
+        attempted += 1
+        raw = await _call(
+            provider,
+            settings,
+            prompt=f"帖子标题：{item.get('title') or ''}",
+            system_prompt=system_prompt,
+            image_urls=urls,
+        )
+        verdict = parse_image_verdict(raw) if raw is not None else None
+        if verdict is None:
+            failures += 1
+            survivors.append(item)  # 单帖 fail-open，一张图挂了不牵连整批
+            continue
+        if verdict.keep:
+            survivors.append(item)
+        else:
+            dropped.append({"item": item, "reason": verdict.reason, "source": "image"})
+
+    # 过半失败：判定为 provider 异常而非个别图片问题，整批推迟重来
+    if attempted and failures * 2 > attempted:
+        logger.warning(
+            f"[{PLUGIN_NAME}] image review failed {failures}/{attempted}, deferring batch"
+        )
+        return ReviewOutcome(True, [], [], False)
+    if skipped:
+        logger.warning(
+            f"[{PLUGIN_NAME}] image review budget reached, "
+            f"{skipped} post(s) pushed without image review"
+        )
+    return ReviewOutcome(False, survivors, dropped, False)

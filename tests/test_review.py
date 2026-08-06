@@ -197,3 +197,122 @@ async def test_disabled_review_keeps_all_without_calling_provider():
 
     assert outcome.kept == [_item("a")]
     assert provider.calls == []
+
+
+def test_images_for_item_prefers_images_then_cover():
+    assert review.images_for_item(
+        {"images": ["https://a.png", "https://b.png"]}, 1
+    ) == ["https://a.png"]
+    assert review.images_for_item(
+        {"images": [], "cover_image": "https://c.png"}, 2
+    ) == ["https://c.png"]
+    assert review.images_for_item({"images": ["ftp://x"]}, 1) == []
+    assert review.images_for_item({"images": ["https://a.png"]}, 0) == []
+
+
+def test_parse_image_verdict_object_and_garbage():
+    verdict = review.parse_image_verdict('```json\n{"keep": false, "reason": "二维码"}\n```')
+
+    assert verdict is not None
+    assert verdict.keep is False
+    assert verdict.source == "image"
+    assert review.parse_image_verdict("没有 JSON") is None
+    assert review.parse_image_verdict("[1,2]") is None
+
+
+@pytest.mark.asyncio
+async def test_image_review_drops_whole_post():
+    provider = FakeProvider(
+        [
+            '[{"i":0,"keep":true},{"i":1,"keep":true}]',
+            '{"keep": false, "reason": "色情配图"}',
+        ]
+    )
+    items = [_item("with-image", images=["https://a.png"]), _item("no-image")]
+
+    outcome = await review.review_batch(
+        provider, items, _settings(image_enabled=True), max_images=1
+    )
+
+    assert [i["item_key"] for i in outcome.kept] == ["no-image"]
+    assert outcome.dropped[0]["source"] == "image"
+    assert outcome.dropped[0]["reason"] == "色情配图"
+    assert outcome.deferred is False
+    assert provider.calls[1]["image_urls"] == ["https://a.png"]
+
+
+@pytest.mark.asyncio
+async def test_single_image_failure_keeps_that_post():
+    provider = FakeProvider(
+        [
+            '[{"i":0,"keep":true},{"i":1,"keep":true}]',
+            "模型胡言乱语",
+            '{"keep": true}',
+        ]
+    )
+    items = [
+        _item("a", images=["https://a.png"]),
+        _item("b", images=["https://b.png"]),
+    ]
+
+    outcome = await review.review_batch(
+        provider, items, _settings(image_enabled=True), max_images=1
+    )
+
+    assert outcome.deferred is False
+    assert [i["item_key"] for i in outcome.kept] == ["a", "b"]
+
+
+@pytest.mark.asyncio
+async def test_majority_image_failures_defer_whole_batch():
+    provider = FakeProvider(
+        [
+            '[{"i":0,"keep":true},{"i":1,"keep":true},{"i":2,"keep":true}]',
+            "坏了",
+            "又坏了",
+            '{"keep": true}',
+        ]
+    )
+    items = [_item(k, images=[f"https://{k}.png"]) for k in ("a", "b", "c")]
+
+    outcome = await review.review_batch(
+        provider, items, _settings(image_enabled=True), max_images=1
+    )
+
+    assert outcome.deferred is True
+    assert outcome.kept == []
+
+
+@pytest.mark.asyncio
+async def test_image_budget_skips_extras_without_dropping():
+    provider = FakeProvider(
+        [
+            '[{"i":0,"keep":true},{"i":1,"keep":true}]',
+            '{"keep": true}',
+        ]
+    )
+    items = [_item(k, images=[f"https://{k}.png"]) for k in ("a", "b")]
+
+    outcome = await review.review_batch(
+        provider,
+        items,
+        _settings(image_enabled=True, image_max_per_batch=1),
+        max_images=1,
+    )
+
+    assert outcome.deferred is False
+    assert [i["item_key"] for i in outcome.kept] == ["a", "b"]
+    assert len(provider.calls) == 2
+
+
+@pytest.mark.asyncio
+async def test_image_review_disabled_skips_second_stage():
+    provider = FakeProvider(['[{"i":0,"keep":true}]'])
+    items = [_item("a", images=["https://a.png"])]
+
+    outcome = await review.review_batch(
+        provider, items, _settings(image_enabled=False), max_images=1
+    )
+
+    assert len(provider.calls) == 1
+    assert len(outcome.kept) == 1
