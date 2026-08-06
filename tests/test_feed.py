@@ -15,6 +15,7 @@ def _plugin() -> feed.DracalonFeedPlugin:
     plugin.config = {}
     plugin._state = feed_state.default_state()
     plugin._migrate_silent = False
+    plugin._provider_warn_at = 0
     return plugin
 
 
@@ -75,7 +76,7 @@ async def test_delivery_tracks_false_return_and_exception(monkeypatch):
 @pytest.mark.asyncio
 async def test_poll_persists_only_the_failed_target(monkeypatch):
     plugin = _plugin()
-    plugin.config = {"targets": ["ok", "missing"]}
+    plugin.config = {"targets": ["ok", "missing"], "digest_enabled": False}
     plugin._state["bootstrap_done"] = True
     plugin._lock = asyncio.Lock()
     plugin._save_state = AsyncMock()
@@ -111,6 +112,7 @@ async def test_poll_batches_multiple_items_into_merged_messages(monkeypatch):
     plugin = _plugin()
     plugin.config = {
         "targets": ["group"],
+        "digest_enabled": False,
         "merge_push_enabled": True,
         "merge_push_threshold": 2,
         "merge_push_batch_size": 2,
@@ -150,6 +152,7 @@ async def test_failed_merged_message_queues_every_item(monkeypatch):
     plugin = _plugin()
     plugin.config = {
         "targets": ["missing"],
+        "digest_enabled": False,
         "merge_push_enabled": True,
         "merge_push_threshold": 2,
         "merge_push_batch_size": 5,
@@ -254,3 +257,218 @@ def test_empty_bootstrap_waits_for_a_valid_feed_item():
     assert plugin._state["bootstrap_done"] is True
     assert plugin._migrate_silent is False
     assert plugin._state["boundary_keys"] == ["first"]
+
+
+@pytest.mark.asyncio
+async def test_new_items_wait_in_buffer_until_window_elapses(monkeypatch):
+    plugin = _plugin()
+    plugin.config = {
+        "targets": ["group"],
+        "digest_enabled": True,
+        "digest_interval_seconds": 1800,
+        "digest_max_items": 10,
+    }
+    plugin._state["bootstrap_done"] = True
+    plugin._state["last_flush_at"] = 1_000
+    plugin._lock = asyncio.Lock()
+    plugin._save_state = AsyncMock()
+    plugin._fetch_page = AsyncMock(return_value=([_item("post")], 1))
+
+    class Context:
+        send_message = AsyncMock(return_value=True)
+
+    async def no_sleep(_delay):
+        return None
+
+    plugin.context = Context()
+    monkeypatch.setattr(feed.asyncio, "sleep", no_sleep)
+    monkeypatch.setattr(feed.time, "time", lambda: 1_100)
+
+    await plugin._poll_once()
+
+    Context.send_message.assert_not_awaited()
+    assert len(plugin._state["digest_buffer"]) == 1
+    assert plugin._state["watermark"] == feed_state.item_ts(_item("post"))
+
+
+@pytest.mark.asyncio
+async def test_buffer_flushes_as_one_merged_message_when_window_elapses(monkeypatch):
+    plugin = _plugin()
+    plugin.config = {
+        "targets": ["group"],
+        "digest_enabled": True,
+        "digest_interval_seconds": 1800,
+        "digest_max_items": 10,
+        "merge_push_enabled": True,
+        "merge_push_threshold": 2,
+        "merge_push_batch_size": 10,
+    }
+    plugin._state["bootstrap_done"] = True
+    plugin._state["last_flush_at"] = 1_000
+    plugin._state["digest_buffer"] = [_item("old-a"), _item("old-b")]
+    plugin._lock = asyncio.Lock()
+    plugin._save_state = AsyncMock()
+    plugin._fetch_page = AsyncMock(return_value=([], 0))
+
+    class Context:
+        send_message = AsyncMock(return_value=True)
+
+    async def no_sleep(_delay):
+        return None
+
+    plugin.context = Context()
+    monkeypatch.setattr(feed.asyncio, "sleep", no_sleep)
+    monkeypatch.setattr(feed.time, "time", lambda: 3_000)
+
+    await plugin._poll_once()
+
+    assert Context.send_message.await_count == 1
+    chain = Context.send_message.await_args.args[1]
+    assert isinstance(chain.chain[0], feed.Comp.Nodes)
+    assert len(chain.chain[0].nodes) == 2
+    assert plugin._state["digest_buffer"] == []
+    assert plugin._state["last_flush_at"] == 3_000
+
+
+@pytest.mark.asyncio
+async def test_item_count_trigger_flushes_before_window(monkeypatch):
+    plugin = _plugin()
+    plugin.config = {
+        "targets": ["group"],
+        "digest_enabled": True,
+        "digest_interval_seconds": 99_999,
+        "digest_max_items": 2,
+        "merge_push_enabled": True,
+        "merge_push_threshold": 2,
+        "merge_push_batch_size": 10,
+    }
+    plugin._state["bootstrap_done"] = True
+    plugin._state["last_flush_at"] = 1_000
+    plugin._lock = asyncio.Lock()
+    plugin._save_state = AsyncMock()
+    items = [_item("post-a"), _item("post-b")]
+    plugin._fetch_page = AsyncMock(return_value=(list(reversed(items)), 2))
+
+    class Context:
+        send_message = AsyncMock(return_value=True)
+
+    async def no_sleep(_delay):
+        return None
+
+    plugin.context = Context()
+    monkeypatch.setattr(feed.asyncio, "sleep", no_sleep)
+    monkeypatch.setattr(feed.time, "time", lambda: 1_100)
+
+    await plugin._poll_once()
+
+    assert Context.send_message.await_count == 1
+    assert plugin._state["digest_buffer"] == []
+
+
+@pytest.mark.asyncio
+async def test_quiet_hours_buffer_and_trim_on_exit(monkeypatch):
+    plugin = _plugin()
+    plugin.config = {
+        "targets": ["group"],
+        "digest_enabled": True,
+        "digest_interval_seconds": 60,
+        "digest_max_items": 99,
+        "quiet_hours_max_catchup": 2,
+        "merge_push_enabled": True,
+        "merge_push_threshold": 2,
+        "merge_push_batch_size": 10,
+    }
+    plugin._state["bootstrap_done"] = True
+    plugin._state["was_quiet"] = True
+    plugin._state["last_flush_at"] = 0
+    plugin._state["digest_buffer"] = [_item(f"old-{i}") for i in range(4)]
+    plugin._lock = asyncio.Lock()
+    plugin._save_state = AsyncMock()
+    plugin._fetch_page = AsyncMock(return_value=([], 0))
+
+    class Context:
+        send_message = AsyncMock(return_value=True)
+
+    async def no_sleep(_delay):
+        return None
+
+    plugin.context = Context()
+    monkeypatch.setattr(feed.asyncio, "sleep", no_sleep)
+    monkeypatch.setattr(feed.time, "time", lambda: 5_000)
+
+    await plugin._poll_once()
+
+    chain = Context.send_message.await_args.args[1]
+    titles = [n.content[0].text for n in chain.chain[0].nodes]
+    assert len(chain.chain[0].nodes) == 2
+    assert "old-2" in titles[0]
+    assert "old-3" in titles[1]
+    assert plugin._state["was_quiet"] is False
+    assert plugin._state["digest_buffer"] == []
+
+
+@pytest.mark.asyncio
+async def test_digest_disabled_delivers_every_poll(monkeypatch):
+    plugin = _plugin()
+    plugin.config = {"targets": ["group"], "digest_enabled": False}
+    plugin._state["bootstrap_done"] = True
+    plugin._state["last_flush_at"] = 999_999
+    plugin._lock = asyncio.Lock()
+    plugin._save_state = AsyncMock()
+    plugin._fetch_page = AsyncMock(return_value=([_item("post")], 1))
+
+    class Context:
+        send_message = AsyncMock(return_value=True)
+
+    async def no_sleep(_delay):
+        return None
+
+    plugin.context = Context()
+    monkeypatch.setattr(feed.asyncio, "sleep", no_sleep)
+    monkeypatch.setattr(feed.time, "time", lambda: 1_000)
+
+    await plugin._poll_once()
+
+    assert Context.send_message.await_count == 1
+    assert plugin._state["digest_buffer"] == []
+
+
+@pytest.mark.asyncio
+async def test_quiet_hours_send_nothing_even_with_digest_disabled(monkeypatch):
+    """静默时段必须彻底静音：既不重试 pending，也不结算 buffer。
+
+    关掉窗口合并（digest_enabled=False）时也不例外 —— 这条曾经会绕过静默判定。
+    """
+    plugin = _plugin()
+    plugin.config = {"targets": ["group"], "digest_enabled": False}
+    plugin._state["bootstrap_done"] = True
+    plugin._state["pending_deliveries"] = [
+        {
+            "item": _item("old"),
+            "targets": ["group"],
+            "attempts": 1,
+            "next_retry_at": 0,
+        }
+    ]
+    plugin._lock = asyncio.Lock()
+    plugin._save_state = AsyncMock()
+    plugin._fetch_page = AsyncMock(return_value=([_item("fresh")], 1))
+    plugin._in_quiet_hours = lambda _now_struct: True
+
+    class Context:
+        send_message = AsyncMock(return_value=True)
+
+    async def no_sleep(_delay):
+        return None
+
+    plugin.context = Context()
+    monkeypatch.setattr(feed.asyncio, "sleep", no_sleep)
+    monkeypatch.setattr(feed.time, "time", lambda: 10_000)
+
+    await plugin._poll_once()
+
+    Context.send_message.assert_not_awaited()
+    assert len(plugin._state["pending_deliveries"]) == 1
+    assert len(plugin._state["digest_buffer"]) == 1
+    assert plugin._state["watermark"] == feed_state.item_ts(_item("fresh"))
+    assert plugin._state["was_quiet"] is True

@@ -66,15 +66,17 @@ def should_flush(
 ) -> bool:
     """是否该结算缓冲区。
 
+    静默时段一律不结算，且必须先于「关闭窗口合并」判定 —— 否则关掉窗口合并会连夜间
+    静默一起绕过，静默时段照样发消息。
     关闭窗口合并时返回 True，让残留 buffer 立刻投递干净，不留永不投递的帖。
-    静默时段与审查退避期间一律不结算；其余按「条数达标」或「周期到期」双触发。
+    审查退避期间同样不结算；其余按「条数达标」或「周期到期」双触发。
     """
     if not (st.get("digest_buffer") or []):
         return False
-    if not settings.enabled:
-        return True
     if in_quiet_hours:
         return False
+    if not settings.enabled:
+        return True
     if int(st.get("review_retry_at", 0) or 0) > now:
         return False
     if len(st["digest_buffer"]) >= settings.max_items:

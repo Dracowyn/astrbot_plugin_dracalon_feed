@@ -12,7 +12,7 @@ from astrbot.api import AstrBotConfig, logger
 from astrbot.api.event import AstrMessageEvent, MessageChain, filter
 from astrbot.api.star import Context, Star, StarTools
 
-from . import render, state
+from . import digest, render, state
 from .state import item_key, item_ts
 
 PLUGIN_NAME = "astrbot_plugin_dracalon_feed"
@@ -344,31 +344,7 @@ class DracalonFeedPlugin(Star):
         new_items = self._select_new(collected, watermark)
         # 升序推送（旧→新），保证水位线单调推进、同秒帖按 item_key 稳定排序
         new_items.sort(key=lambda it: (item_ts(it) or 0, str(item_key(it) or "")))
-
-        # 夜间静默：窗口内不发送、不推进水位线（积压留到窗口结束自然补推，不丢帖）
-        if self._in_quiet_hours(time.localtime()):
-            async with self._lock:
-                self._state["was_quiet"] = True
-                self._state["last_poll_at"] = int(time.time())
-                if not self._state.get("pending_deliveries"):
-                    self._state["last_error"] = ""
-            await self._save_state()
-            return
-
-        # 刚退出静默且积压超上限：只推最新 N 条，其余靠推进水位线标记已读（防早高峰刷屏）
-        dropped: list[dict[str, Any]] = []
-        max_catchup = int(self.config.get("quiet_hours_max_catchup", 5) or 0)
-        if (
-            bool(self._state.get("was_quiet", False))
-            and max_catchup > 0
-            and len(new_items) > max_catchup
-        ):
-            dropped = new_items[:-max_catchup]
-            new_items = new_items[-max_catchup:]
-            logger.info(
-                f"[{PLUGIN_NAME}] quiet-hours catch-up: push latest {len(new_items)}, "
-                f"skip {len(dropped)} backlog"
-            )
+        in_quiet = self._in_quiet_hours(time.localtime())
 
         targets = list(dict.fromkeys(self.config.get("targets", []) or []))
         delivery_error = (
@@ -381,56 +357,139 @@ class DracalonFeedPlugin(Star):
         pending: list[dict[str, Any]] = []
         configured_targets = set(targets)
         now = int(time.time())
-        for entry in list(self._state.get("pending_deliveries", []) or []):
-            if not isinstance(entry, dict) or not isinstance(entry.get("item"), dict):
-                continue
-            retry_targets = [
-                umo
-                for umo in entry.get("targets", [])
-                if isinstance(umo, str) and umo in configured_targets
-            ]
-            if not retry_targets:
-                continue
-            if int(entry.get("next_retry_at", 0) or 0) > now:
-                pending.append({**entry, "targets": retry_targets})
-                continue
-            failed, error = await self._deliver_to_targets(entry["item"], retry_targets)
-            if failed:
-                attempts = int(entry.get("attempts", 0) or 0) + 1
-                pending.append(
-                    {
-                        "item": entry["item"],
-                        "targets": failed,
-                        "attempts": attempts,
-                        "next_retry_at": now
-                        + min(
-                            RETRY_MAX_SECONDS,
-                            RETRY_BASE_SECONDS * 2 ** min(attempts - 1, 5),
-                        ),
-                    }
+        if in_quiet:
+            # 静默期一律不发消息，重试队列原样留到窗口结束
+            pending = list(self._state.get("pending_deliveries", []) or [])
+        else:
+            for entry in list(self._state.get("pending_deliveries", []) or []):
+                if not isinstance(entry, dict) or not isinstance(
+                    entry.get("item"), dict
+                ):
+                    continue
+                retry_targets = [
+                    umo
+                    for umo in entry.get("targets", [])
+                    if isinstance(umo, str) and umo in configured_targets
+                ]
+                if not retry_targets:
+                    continue
+                if int(entry.get("next_retry_at", 0) or 0) > now:
+                    pending.append({**entry, "targets": retry_targets})
+                    continue
+                failed, error = await self._deliver_to_targets(
+                    entry["item"], retry_targets
                 )
-                delivery_error = error or delivery_error
-            await asyncio.sleep(INTER_ITEM_DELAY)
+                if failed:
+                    attempts = int(entry.get("attempts", 0) or 0) + 1
+                    pending.append(
+                        {
+                            "item": entry["item"],
+                            "targets": failed,
+                            "attempts": attempts,
+                            "next_retry_at": now
+                            + min(
+                                RETRY_MAX_SECONDS,
+                                RETRY_BASE_SECONDS * 2 ** min(attempts - 1, 5),
+                            ),
+                        }
+                    )
+                    delivery_error = error or delivery_error
+                await asyncio.sleep(INTER_ITEM_DELAY)
 
         async with self._lock:
             self._state["pending_deliveries"] = pending
         await self._save_state()
 
+        digest_settings = digest.settings_from_config(self.config)
+
+        # 收录：新帖入缓冲区的同时推进水位线。二者在同一把锁、同一次落盘里写入，
+        # 因此不存在「水位线推进了但帖子丢了」的撕裂窗口。
+        async with self._lock:
+            digest.enqueue(self._state, new_items)
+            for item in new_items:
+                state.advance_watermark(self._state, item)
+            if in_quiet:
+                self._state["was_quiet"] = True
+            self._state["last_poll_at"] = int(time.time())
+        await self._save_state()
+
+        now = int(time.time())
+        if not digest.should_flush(
+            self._state, digest_settings, now=now, in_quiet_hours=in_quiet
+        ):
+            async with self._lock:
+                if not self._state.get("pending_deliveries"):
+                    delivery_error = ""
+                self._state["last_error"] = delivery_error
+            await self._save_state()
+            return
+
+        await self._flush_digest(targets)
+
+        async with self._lock:
+            if not self._state.get("pending_deliveries"):
+                delivery_error = ""
+            elif delivery_error:
+                self._state["last_error"] = delivery_error
+        await self._save_state()
+
+    async def _flush_digest(self, targets: list[str]) -> tuple[int, int, bool]:
+        """结算缓冲区：取出全部待推帖子，投递后清空。
+
+        Args:
+            targets: 已去重的推送目标列表。
+
+        Returns:
+            (已投递帖数, 被审查丢弃帖数, 是否推迟到下轮)。本阶段审查尚未接入，
+            丢弃数恒为 0、推迟恒为 False；后续任务会在此处插入审查。
+        """
+        async with self._lock:
+            buffer = list(self._state.get("digest_buffer") or [])
+            was_quiet = bool(self._state.get("was_quiet", False))
+        if not buffer:
+            return 0, 0, False
+
+        # 刚退出静默且积压超上限：只推最新 N 条，其余直接丢（水位线已在收录时推进）
+        if was_quiet:
+            max_catchup = int(self.config.get("quiet_hours_max_catchup", 5) or 0)
+            buffer, backlog_dropped = digest.trim_for_quiet_catchup(buffer, max_catchup)
+            if backlog_dropped:
+                logger.info(
+                    f"[{PLUGIN_NAME}] quiet-hours catch-up: push latest {len(buffer)}, "
+                    f"skip {len(backlog_dropped)} backlog"
+                )
+
+        await self._deliver_batch(buffer, targets)
+
+        async with self._lock:
+            self._state["digest_buffer"] = []
+            self._state["last_flush_at"] = int(time.time())
+            self._state["was_quiet"] = False
+        await self._save_state()
+        return len(buffer), 0, False
+
+    async def _deliver_batch(
+        self, items: list[dict[str, Any]], targets: list[str]
+    ) -> None:
+        """按合并推送配置把一批帖子切片投递，失败的目标进重试队列。
+
+        水位线已在收录阶段推进，这里不再推进 —— 重复推进会跳过尚未投递的帖。
+        """
         merge_enabled = bool(self.config.get("merge_push_enabled", True))
         merge_threshold = max(2, int(self.config.get("merge_push_threshold", 2) or 2))
         merge_batch_size = max(
             merge_threshold,
             min(20, int(self.config.get("merge_push_batch_size", 5) or 5)),
         )
-        if merge_enabled and len(new_items) >= merge_threshold:
-            delivery_batches = [
-                new_items[offset : offset + merge_batch_size]
-                for offset in range(0, len(new_items), merge_batch_size)
+        if merge_enabled and len(items) >= merge_threshold:
+            batches = [
+                items[offset : offset + merge_batch_size]
+                for offset in range(0, len(items), merge_batch_size)
             ]
         else:
-            delivery_batches = [[item] for item in new_items]
+            batches = [[item] for item in items]
 
-        for batch in delivery_batches:
+        for batch in batches:
             chain = (
                 render.build_merged_chain(
                     batch, style=self._style(), max_images=self._max_images()
@@ -443,9 +502,9 @@ class DracalonFeedPlugin(Star):
             failed, error = await self._deliver_to_targets(
                 batch[-1], targets, chain=chain
             )
-            async with self._lock:
-                for item in batch:
-                    if failed:
+            if failed:
+                async with self._lock:
+                    for item in batch:
                         self._state.setdefault("pending_deliveries", []).append(
                             {
                                 "item": item,
@@ -454,24 +513,11 @@ class DracalonFeedPlugin(Star):
                                 "next_retry_at": int(time.time()) + RETRY_BASE_SECONDS,
                             }
                         )
-                        delivery_error = error or delivery_error
-                    state.advance_watermark(self._state, item)
-            await self._save_state()
+                    self._state["last_error"] = error or self._state.get(
+                        "last_error", ""
+                    )
+                await self._save_state()
             await asyncio.sleep(INTER_ITEM_DELAY)
-
-        # 被丢弃的积压（比已推条目更旧）并入水位线标记已读，防止下轮重新当新帖
-        if dropped:
-            async with self._lock:
-                for item in dropped:
-                    state.advance_watermark(self._state, item)
-
-        async with self._lock:
-            self._state["was_quiet"] = False
-            self._state["last_poll_at"] = int(time.time())
-            if not self._state.get("pending_deliveries"):
-                delivery_error = ""
-            self._state["last_error"] = delivery_error
-        await self._save_state()
 
     async def _collect_backlog(
         self, first_page: list[dict[str, Any]], total: int, watermark: int
