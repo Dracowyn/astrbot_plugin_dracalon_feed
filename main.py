@@ -12,7 +12,7 @@ from astrbot.api import AstrBotConfig, logger
 from astrbot.api.event import AstrMessageEvent, MessageChain, filter
 from astrbot.api.star import Context, Star, StarTools
 
-from . import digest, render, state
+from . import digest, render, review, state
 from .state import item_key, item_ts
 
 PLUGIN_NAME = "astrbot_plugin_dracalon_feed"
@@ -21,6 +21,8 @@ INTER_TARGET_DELAY = 0.3
 INTER_ITEM_DELAY = 0.5
 RETRY_BASE_SECONDS = 120
 RETRY_MAX_SECONDS = 3600
+FILTERED_LOG_LIMIT = 10
+PROVIDER_WARN_INTERVAL = 3600
 
 # 单页拉取条数（后端 FeedService::PAGE_SIZE_MAX = 50，取满）
 FETCH_PAGE_SIZE = 50
@@ -44,6 +46,7 @@ class DracalonFeedPlugin(Star):
         # 旧版本（基于 pushed_urls 去重）升级而来且此前已运行过时，下一轮 bootstrap
         # 强制走 mark_all：把当前 feed 全部对齐为已读、零重推。非持久化、用一次即弃。
         self._migrate_silent = bool(self._state.pop("_needs_silent_migration", False))
+        self._provider_warn_at = 0
 
     # ------------------------------------------------------------------
     # 命令组（必须在 class 内定义；子命令通过 @<group_method>.command 注册）
@@ -434,14 +437,14 @@ class DracalonFeedPlugin(Star):
         await self._save_state()
 
     async def _flush_digest(self, targets: list[str]) -> tuple[int, int, bool]:
-        """结算缓冲区：取出全部待推帖子，投递后清空。
+        """结算缓冲区：审查后取出保留的帖子，投递后清空。
 
         Args:
             targets: 已去重的推送目标列表。
 
         Returns:
-            (已投递帖数, 被审查丢弃帖数, 是否推迟到下轮)。本阶段审查尚未接入，
-            丢弃数恒为 0、推迟恒为 False；后续任务会在此处插入审查。
+            (已投递帖数, 被审查丢弃帖数, 是否推迟到下轮)。审查失败时缓冲区原样保留，
+            退避到期后下轮重审；连续失败达上限后整批放行，绝不无限扣留。
         """
         async with self._lock:
             buffer = list(self._state.get("digest_buffer") or [])
@@ -459,14 +462,105 @@ class DracalonFeedPlugin(Star):
                     f"skip {len(backlog_dropped)} backlog"
                 )
 
-        await self._deliver_batch(buffer, targets)
+        review_settings = review.settings_from_config(self.config)
+        outcome = await review.review_batch(
+            self._review_provider(),
+            buffer,
+            review_settings,
+            max_images=self._max_images(),
+        )
+
+        if outcome.deferred:
+            async with self._lock:
+                attempts = int(self._state.get("review_attempts", 0) or 0) + 1
+                if attempts < review_settings.max_attempts:
+                    # 缓冲区原样留着，下轮退避到期后重审
+                    self._state["review_attempts"] = attempts
+                    self._state["review_retry_at"] = int(time.time()) + (
+                        review.backoff_seconds(attempts)
+                    )
+                    deferred = True
+                else:
+                    # 连续失败达上限：整批放行，绝不无限扣留
+                    self._state["review_attempts"] = 0
+                    self._state["review_retry_at"] = 0
+                    deferred = False
+            await self._save_state()
+            if deferred:
+                logger.info(
+                    f"[{PLUGIN_NAME}] review deferred batch of {len(buffer)} "
+                    f"(attempt {attempts}/{review_settings.max_attempts})"
+                )
+                return 0, 0, True
+            logger.warning(
+                f"[{PLUGIN_NAME}] review unavailable after "
+                f"{review_settings.max_attempts} attempts, releasing batch"
+            )
+            kept, dropped = list(buffer), []
+        else:
+            kept, dropped = list(outcome.kept), list(outcome.dropped)
+
+        if kept:
+            await self._deliver_batch(kept, targets)
 
         async with self._lock:
+            self._record_filtered(dropped)
             self._state["digest_buffer"] = []
             self._state["last_flush_at"] = int(time.time())
             self._state["was_quiet"] = False
+            self._state["review_attempts"] = 0
+            self._state["review_retry_at"] = 0
         await self._save_state()
-        return len(buffer), 0, False
+        return len(kept), len(dropped), False
+
+    def _review_provider(self) -> Any | None:
+        """取审查用 Provider。取不到视为「未配置」，按小时节流告警。
+
+        未配置与瞬时故障是两回事：前者整批放行且不累加重试次数，
+        后者才走推迟重试路径。
+        """
+        settings_id = str(self.config.get("review_provider_id", "") or "").strip()
+        try:
+            provider = (
+                self.context.get_provider_by_id(settings_id)
+                if settings_id
+                else self.context.get_using_provider()
+            )
+        except Exception as e:
+            provider = None
+            logger.warning(f"[{PLUGIN_NAME}] get review provider failed: {e}")
+        if provider is not None and not hasattr(provider, "text_chat"):
+            provider = None
+        if provider is None:
+            now = int(time.time())
+            if now - self._provider_warn_at >= PROVIDER_WARN_INTERVAL:
+                self._provider_warn_at = now
+                logger.warning(
+                    f"[{PLUGIN_NAME}] no usable LLM provider for review, "
+                    "pushing without content review"
+                )
+        return provider
+
+    def _record_filtered(self, dropped: list[dict[str, Any]]) -> None:
+        """把被毙掉的帖记进环形日志，供 /dracalon_feed filtered 调 prompt 用。
+
+        调用方须已持锁 —— 本函数内部不取锁，避免死锁。
+        """
+        if not dropped:
+            return
+        now = int(time.time())
+        entries = [
+            {
+                "title": str(entry["item"].get("title") or "(无标题)"),
+                "url": str(entry["item"].get("url") or ""),
+                "reason": str(entry.get("reason") or ""),
+                "source": str(entry.get("source") or "text"),
+                "at": now,
+            }
+            for entry in dropped
+        ]
+        existing = list(self._state.get("filtered_recent") or [])
+        self._state["filtered_recent"] = (entries + existing)[:FILTERED_LOG_LIMIT]
 
     async def _deliver_batch(
         self, items: list[dict[str, Any]], targets: list[str]

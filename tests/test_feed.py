@@ -472,3 +472,139 @@ async def test_quiet_hours_send_nothing_even_with_digest_disabled(monkeypatch):
     assert len(plugin._state["digest_buffer"]) == 1
     assert plugin._state["watermark"] == feed_state.item_ts(_item("fresh"))
     assert plugin._state["was_quiet"] is True
+
+
+def _flush_plugin(monkeypatch, *, provider, config_extra=None):
+    plugin = _plugin()
+    plugin.config = {
+        "targets": ["group"],
+        "digest_enabled": True,
+        "digest_interval_seconds": 60,
+        "digest_max_items": 99,
+        "merge_push_enabled": True,
+        "merge_push_threshold": 2,
+        "merge_push_batch_size": 10,
+        "review_enabled": True,
+    }
+    plugin.config.update(config_extra or {})
+    plugin._state["bootstrap_done"] = True
+    plugin._state["last_flush_at"] = 0
+    plugin._lock = asyncio.Lock()
+    plugin._save_state = AsyncMock()
+    plugin._fetch_page = AsyncMock(return_value=([], 0))
+    plugin._review_provider = lambda: provider
+
+    class Context:
+        send_message = AsyncMock(return_value=True)
+
+    async def no_sleep(_delay):
+        return None
+
+    plugin.context = Context()
+    monkeypatch.setattr(feed.asyncio, "sleep", no_sleep)
+    return plugin, Context
+
+
+class _FakeProvider:
+    def __init__(self, replies):
+        self.replies = list(replies)
+        self.calls = []
+
+    async def text_chat(self, **kwargs):
+        self.calls.append(kwargs)
+        reply = self.replies.pop(0) if self.replies else ""
+
+        class Resp:
+            completion_text = reply
+
+        return Resp()
+
+
+@pytest.mark.asyncio
+async def test_flush_drops_rejected_items_and_records_them(monkeypatch):
+    provider = _FakeProvider(
+        ['[{"i":0,"keep":false,"reason":"灌水"},{"i":1,"keep":true}]']
+    )
+    plugin, Context = _flush_plugin(
+        monkeypatch, provider=provider, config_extra={"image_review_enabled": False}
+    )
+    plugin._state["digest_buffer"] = [_item("spam"), _item("good")]
+    monkeypatch.setattr(feed.time, "time", lambda: 5_000)
+
+    await plugin._poll_once()
+
+    assert Context.send_message.await_count == 1
+    chain = Context.send_message.await_args.args[1]
+    assert isinstance(chain.chain[0], feed.Comp.Plain)
+    assert "good" in chain.chain[0].text
+    assert plugin._state["digest_buffer"] == []
+    assert plugin._state["filtered_recent"][0]["reason"] == "灌水"
+    assert plugin._state["filtered_recent"][0]["source"] == "text"
+
+
+@pytest.mark.asyncio
+async def test_review_failure_defers_buffer_and_sets_backoff(monkeypatch):
+    provider = _FakeProvider(["模型抽风"])
+    plugin, Context = _flush_plugin(
+        monkeypatch, provider=provider, config_extra={"image_review_enabled": False}
+    )
+    plugin._state["digest_buffer"] = [_item("post")]
+    monkeypatch.setattr(feed.time, "time", lambda: 5_000)
+
+    await plugin._poll_once()
+
+    Context.send_message.assert_not_awaited()
+    assert len(plugin._state["digest_buffer"]) == 1
+    assert plugin._state["review_attempts"] == 1
+    assert plugin._state["review_retry_at"] == 5_000 + 120
+    assert plugin._state["last_flush_at"] == 0
+
+
+@pytest.mark.asyncio
+async def test_review_releases_batch_after_max_attempts(monkeypatch):
+    provider = _FakeProvider(["还是抽风"])
+    plugin, Context = _flush_plugin(
+        monkeypatch,
+        provider=provider,
+        config_extra={"image_review_enabled": False, "review_max_attempts": 3},
+    )
+    plugin._state["digest_buffer"] = [_item("post")]
+    plugin._state["review_attempts"] = 2
+    monkeypatch.setattr(feed.time, "time", lambda: 5_000)
+
+    await plugin._poll_once()
+
+    assert Context.send_message.await_count == 1
+    assert plugin._state["digest_buffer"] == []
+    assert plugin._state["review_attempts"] == 0
+    assert plugin._state["review_retry_at"] == 0
+
+
+@pytest.mark.asyncio
+async def test_missing_provider_pushes_everything(monkeypatch):
+    plugin, Context = _flush_plugin(monkeypatch, provider=None)
+    plugin._state["digest_buffer"] = [_item("post")]
+    monkeypatch.setattr(feed.time, "time", lambda: 5_000)
+
+    await plugin._poll_once()
+
+    assert Context.send_message.await_count == 1
+    assert plugin._state["review_attempts"] == 0
+    assert plugin._state["digest_buffer"] == []
+
+
+@pytest.mark.asyncio
+async def test_filtered_recent_is_capped(monkeypatch):
+    plugin = _plugin()
+    plugin._lock = asyncio.Lock()
+    plugin._state["filtered_recent"] = [
+        {"title": f"t{i}", "url": "u", "reason": "r", "source": "text", "at": 0}
+        for i in range(10)
+    ]
+
+    plugin._record_filtered(
+        [{"item": _item("newest"), "reason": "广告", "source": "text"}]
+    )
+
+    assert len(plugin._state["filtered_recent"]) == 10
+    assert plugin._state["filtered_recent"][0]["reason"] == "广告"
