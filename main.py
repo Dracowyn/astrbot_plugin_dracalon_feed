@@ -114,11 +114,17 @@ class DracalonFeedPlugin(Star):
         provider_available = (
             self._review_provider() is not None if review_settings.enabled else False
         )
+        image_available = (
+            self._image_review_provider() is not None
+            if review_settings.enabled and review_settings.image_enabled
+            else True
+        )
         lines = status_text.build_lines(
             self.config,
             self._state,
             in_quiet_hours=self._in_quiet_hours(time.localtime()),
             review_provider_available=provider_available,
+            image_provider_available=image_available,
         )
         yield event.plain_result("\n".join(lines))
 
@@ -470,6 +476,7 @@ class DracalonFeedPlugin(Star):
         review_settings = review.settings_from_config(self.config)
         outcome = await review.review_batch(
             self._review_provider(),
+            self._image_review_provider() if review_settings.image_enabled else None,
             buffer,
             review_settings,
             max_images=self._max_images(),
@@ -518,22 +525,24 @@ class DracalonFeedPlugin(Star):
         await self._save_state()
         return len(kept), len(dropped), False
 
-    def _review_provider(self) -> Any | None:
-        """取审查用 Provider。取不到视为「未配置」，按小时节流告警。
+    def _resolve_provider(self, provider_id: str, label: str) -> Any | None:
+        """按 ID 取 Provider，ID 为空则取当前默认。取不到视为「未配置」，按小时节流告警。
 
         未配置与瞬时故障是两回事：前者整批放行且不累加重试次数，
         后者才走推迟重试路径。
+
+        图片审查未指定 ID 时回落到**当前默认模型**而非文本审查模型 —— 文本段常被
+        挂上便宜的纯文本模型，继承过来会让每张图都调用失败。
         """
-        settings_id = str(self.config.get("review_provider_id", "") or "").strip()
         try:
             provider = (
-                self.context.get_provider_by_id(settings_id)
-                if settings_id
+                self.context.get_provider_by_id(provider_id)
+                if provider_id
                 else self.context.get_using_provider()
             )
         except Exception as e:
             provider = None
-            logger.warning(f"[{PLUGIN_NAME}] get review provider failed: {e}")
+            logger.warning(f"[{PLUGIN_NAME}] get {label} provider failed: {e}")
         if provider is not None and not hasattr(provider, "text_chat"):
             provider = None
         if provider is None:
@@ -541,10 +550,24 @@ class DracalonFeedPlugin(Star):
             if now - self._provider_warn_at >= PROVIDER_WARN_INTERVAL:
                 self._provider_warn_at = now
                 logger.warning(
-                    f"[{PLUGIN_NAME}] no usable LLM provider for review, "
+                    f"[{PLUGIN_NAME}] no usable LLM provider for {label}, "
                     "pushing without content review"
                 )
         return provider
+
+    def _review_provider(self) -> Any | None:
+        """文本审查用 Provider。"""
+        return self._resolve_provider(
+            str(self.config.get("review_provider_id", "") or "").strip(),
+            "text review",
+        )
+
+    def _image_review_provider(self) -> Any | None:
+        """配图审查用 Provider。未单独指定时用当前默认模型（不继承文本审查模型）。"""
+        return self._resolve_provider(
+            str(self.config.get("image_review_provider_id", "") or "").strip(),
+            "image review",
+        )
 
     def _record_filtered(self, dropped: list[dict[str, Any]]) -> None:
         """把被毙掉的帖记进环形日志，供 /dracalon_feed filtered 调 prompt 用。

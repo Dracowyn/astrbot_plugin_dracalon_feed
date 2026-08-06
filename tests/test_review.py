@@ -11,7 +11,10 @@ def _settings(**kw) -> review.ReviewSettings:
     base = {
         "enabled": True,
         "provider_id": "",
+        "image_provider_id": "",
         "extra_rules": "",
+        "text_prompt": "",
+        "image_prompt": "",
         "max_attempts": 3,
         "timeout_seconds": 30,
         "image_enabled": False,
@@ -73,10 +76,11 @@ def test_settings_from_config_reads_all_keys():
 
 
 def test_system_prompt_appends_extra_rules():
-    prompt = review.build_system_prompt("禁止推送同人图")
+    prompt = review.build_system_prompt(review.BASE_RULES, "禁止推送同人图")
 
     assert "禁止推送同人图" in prompt
-    assert len(prompt) > len("禁止推送同人图")
+    assert prompt.startswith(review.BASE_RULES)
+    assert len(prompt) > len(review.BASE_RULES)
 
 
 def test_text_user_prompt_numbers_items_from_zero():
@@ -136,7 +140,7 @@ async def test_missing_index_defaults_to_keep():
     provider = FakeProvider(['[{"i":0,"keep":false,"reason":"水帖"}]'])
 
     outcome = await review.review_batch(
-        provider, [_item("a"), _item("b")], _settings(), max_images=1
+        provider, provider, [_item("a"), _item("b")], _settings(), max_images=1
     )
 
     assert outcome.deferred is False
@@ -149,7 +153,7 @@ async def test_missing_index_defaults_to_keep():
 async def test_unparseable_response_defers_whole_batch():
     provider = FakeProvider(["我拒绝回答"])
 
-    outcome = await review.review_batch(provider, [_item("a")], _settings(), max_images=1)
+    outcome = await review.review_batch(provider, provider, [_item("a")], _settings(), max_images=1)
 
     assert outcome.deferred is True
     assert outcome.kept == []
@@ -160,7 +164,7 @@ async def test_unparseable_response_defers_whole_batch():
 async def test_provider_exception_defers_whole_batch():
     provider = FakeProvider([RuntimeError("boom")])
 
-    outcome = await review.review_batch(provider, [_item("a")], _settings(), max_images=1)
+    outcome = await review.review_batch(provider, provider, [_item("a")], _settings(), max_images=1)
 
     assert outcome.deferred is True
 
@@ -172,7 +176,7 @@ async def test_timeout_defers_whole_batch():
             await asyncio.sleep(10)
 
     outcome = await review.review_batch(
-        SlowProvider(), [_item("a")], _settings(timeout_seconds=0), max_images=1
+        SlowProvider(), SlowProvider(), [_item("a")], _settings(timeout_seconds=0), max_images=1
     )
 
     assert outcome.deferred is True
@@ -180,7 +184,7 @@ async def test_timeout_defers_whole_batch():
 
 @pytest.mark.asyncio
 async def test_no_provider_marks_unavailable_and_keeps_all():
-    outcome = await review.review_batch(None, [_item("a")], _settings(), max_images=1)
+    outcome = await review.review_batch(None, None, [_item("a")], _settings(), max_images=1)
 
     assert outcome.unavailable is True
     assert outcome.deferred is False
@@ -192,7 +196,7 @@ async def test_disabled_review_keeps_all_without_calling_provider():
     provider = FakeProvider(["不该被调用"])
 
     outcome = await review.review_batch(
-        provider, [_item("a")], _settings(enabled=False), max_images=1
+        provider, provider, [_item("a")], _settings(enabled=False), max_images=1
     )
 
     assert outcome.kept == [_item("a")]
@@ -231,7 +235,7 @@ async def test_image_review_drops_whole_post():
     items = [_item("with-image", images=["https://a.png"]), _item("no-image")]
 
     outcome = await review.review_batch(
-        provider, items, _settings(image_enabled=True), max_images=1
+        provider, provider, items, _settings(image_enabled=True), max_images=1
     )
 
     assert [i["item_key"] for i in outcome.kept] == ["no-image"]
@@ -256,7 +260,7 @@ async def test_single_image_failure_keeps_that_post():
     ]
 
     outcome = await review.review_batch(
-        provider, items, _settings(image_enabled=True), max_images=1
+        provider, provider, items, _settings(image_enabled=True), max_images=1
     )
 
     assert outcome.deferred is False
@@ -276,7 +280,7 @@ async def test_majority_image_failures_defer_whole_batch():
     items = [_item(k, images=[f"https://{k}.png"]) for k in ("a", "b", "c")]
 
     outcome = await review.review_batch(
-        provider, items, _settings(image_enabled=True), max_images=1
+        provider, provider, items, _settings(image_enabled=True), max_images=1
     )
 
     assert outcome.deferred is True
@@ -295,6 +299,7 @@ async def test_image_budget_skips_extras_without_dropping():
 
     outcome = await review.review_batch(
         provider,
+        provider,
         items,
         _settings(image_enabled=True, image_max_per_batch=1),
         max_images=1,
@@ -311,8 +316,98 @@ async def test_image_review_disabled_skips_second_stage():
     items = [_item("a", images=["https://a.png"])]
 
     outcome = await review.review_batch(
-        provider, items, _settings(image_enabled=False), max_images=1
+        provider, provider, items, _settings(image_enabled=False), max_images=1
     )
 
     assert len(provider.calls) == 1
+    assert len(outcome.kept) == 1
+
+
+def test_settings_reads_separate_image_provider_and_prompts():
+    s = review.settings_from_config(
+        {
+            "review_provider_id": "text-model",
+            "image_review_provider_id": "vision-model",
+            "review_prompt": "我自己的文本审查提示词",
+            "image_review_prompt": "我自己的配图审查提示词",
+        }
+    )
+
+    assert s.provider_id == "text-model"
+    assert s.image_provider_id == "vision-model"
+    assert s.text_prompt == "我自己的文本审查提示词"
+    assert s.image_prompt == "我自己的配图审查提示词"
+
+
+def test_blank_prompt_falls_back_to_builtin():
+    s = review.settings_from_config({})
+
+    assert s.text_prompt == ""
+    assert s.image_prompt == ""
+    assert review.build_system_prompt(s.text_prompt or review.BASE_RULES, "") == (
+        review.BASE_RULES
+    )
+
+
+def test_custom_prompt_replaces_builtin_but_extra_rules_still_append():
+    prompt = review.build_system_prompt("只保留技术贴", "另外禁止转载")
+
+    assert prompt.startswith("只保留技术贴")
+    assert "另外禁止转载" in prompt
+    assert "灌水帖" not in prompt
+
+
+@pytest.mark.asyncio
+async def test_text_and_image_stages_use_their_own_providers():
+    text_provider = FakeProvider(['[{"i":0,"keep":true}]'])
+    image_provider = FakeProvider(['{"keep": false, "reason": "二维码"}'])
+    items = [_item("a", images=["https://a.png"])]
+
+    outcome = await review.review_batch(
+        text_provider,
+        image_provider,
+        items,
+        _settings(image_enabled=True),
+        max_images=1,
+    )
+
+    assert len(text_provider.calls) == 1
+    assert len(image_provider.calls) == 1
+    assert image_provider.calls[0]["image_urls"] == ["https://a.png"]
+    assert outcome.kept == []
+    assert outcome.dropped[0]["source"] == "image"
+
+
+@pytest.mark.asyncio
+async def test_custom_prompts_reach_the_provider():
+    text_provider = FakeProvider(['[{"i":0,"keep":true}]'])
+    image_provider = FakeProvider(['{"keep": true}'])
+    items = [_item("a", images=["https://a.png"])]
+
+    await review.review_batch(
+        text_provider,
+        image_provider,
+        items,
+        _settings(
+            image_enabled=True,
+            text_prompt="自定义文本规则",
+            image_prompt="自定义配图规则",
+        ),
+        max_images=1,
+    )
+
+    assert text_provider.calls[0]["system_prompt"].startswith("自定义文本规则")
+    assert image_provider.calls[0]["system_prompt"].startswith("自定义配图规则")
+
+
+@pytest.mark.asyncio
+async def test_missing_image_provider_skips_image_stage_without_dropping():
+    text_provider = FakeProvider(['[{"i":0,"keep":true}]'])
+    items = [_item("a", images=["https://a.png"])]
+
+    outcome = await review.review_batch(
+        text_provider, None, items, _settings(image_enabled=True), max_images=1
+    )
+
+    assert outcome.deferred is False
     assert len(outcome.kept) == 1

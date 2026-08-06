@@ -9,6 +9,7 @@ import pytest
 
 from astrbot_plugin_dracalon_feed import main as feed
 from astrbot_plugin_dracalon_feed import state as feed_state
+from astrbot_plugin_dracalon_feed import status_text as feed_status_text
 
 PLUGIN_ROOT = Path(feed.__file__).resolve().parent
 
@@ -121,3 +122,15 @@ async def test_status_reports_digest_and_review():
 
     assert "缓冲区" in lines[0]
     assert "审查" in lines[0]
+
+
+def test_status_flags_missing_image_provider():
+    lines = feed_status_text.build_lines(
+        {"review_enabled": True, "image_review_enabled": True},
+        feed_state.default_state(),
+        in_quiet_hours=False,
+        review_provider_available=True,
+        image_provider_available=False,
+    )
+
+    assert any("配图审查无可用模型" in line for line in lines)

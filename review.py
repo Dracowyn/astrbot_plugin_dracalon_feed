@@ -51,7 +51,12 @@ IMAGE_RULES = """你是社区新帖推送的配图审查员。给定一条帖子
 class ReviewSettings:
     enabled: bool
     provider_id: str
+    image_provider_id: str
     extra_rules: str
+    # text_prompt / image_prompt 为空表示用内置的 BASE_RULES / IMAGE_RULES。
+    # 非空则整段替换内置规则，extra_rules 仍照常追加在后面。
+    text_prompt: str
+    image_prompt: str
     max_attempts: int
     timeout_seconds: int
     image_enabled: bool
@@ -77,7 +82,10 @@ def settings_from_config(config: Mapping[str, Any]) -> ReviewSettings:
     return ReviewSettings(
         enabled=bool(config.get("review_enabled", True)),
         provider_id=str(config.get("review_provider_id", "") or "").strip(),
+        image_provider_id=str(config.get("image_review_provider_id", "") or "").strip(),
         extra_rules=str(config.get("review_extra_rules", "") or "").strip(),
+        text_prompt=str(config.get("review_prompt", "") or "").strip(),
+        image_prompt=str(config.get("image_review_prompt", "") or "").strip(),
         max_attempts=max(1, int(config.get("review_max_attempts", 3) or 3)),
         timeout_seconds=max(1, int(config.get("review_timeout_seconds", 30) or 30)),
         image_enabled=bool(config.get("image_review_enabled", True)),
@@ -87,8 +95,9 @@ def settings_from_config(config: Mapping[str, Any]) -> ReviewSettings:
     )
 
 
-def build_system_prompt(extra_rules: str) -> str:
-    return f"{BASE_RULES}\n\n补充规则：\n{extra_rules}" if extra_rules else BASE_RULES
+def build_system_prompt(base_rules: str, extra_rules: str) -> str:
+    """拼装 system prompt：base_rules 是内置规则或用户的整段自定义，extra_rules 追加在后。"""
+    return f"{base_rules}\n\n补充规则：\n{extra_rules}" if extra_rules else base_rules
 
 
 def build_text_user_prompt(items: list[dict[str, Any]]) -> str:
@@ -181,25 +190,31 @@ async def _call(
 
 
 async def review_batch(
-    provider: Any,
+    text_provider: Any,
+    image_provider: Any,
     items: list[dict[str, Any]],
     settings: ReviewSettings,
     *,
     max_images: int,
 ) -> ReviewOutcome:
-    """审查一批帖子：先文本批量判去留，再对保留下来且带图的帖逐帖复审配图。"""
+    """审查一批帖子：先文本批量判去留，再对保留下来且带图的帖逐帖复审配图。
+
+    两段各用自己的 Provider —— 文本段可以挂便宜的纯文本模型，图片段必须是多模态模型。
+    """
     if not items:
         return ReviewOutcome(False, [], [], False)
     if not settings.enabled:
         return ReviewOutcome(False, list(items), [], False)
-    if provider is None:
+    if text_provider is None:
         return ReviewOutcome(False, list(items), [], True)
 
     raw = await _call(
-        provider,
+        text_provider,
         settings,
         prompt=build_text_user_prompt(items),
-        system_prompt=build_system_prompt(settings.extra_rules),
+        system_prompt=build_system_prompt(
+            settings.text_prompt or BASE_RULES, settings.extra_rules
+        ),
     )
     verdicts = parse_text_verdicts(raw) if raw is not None else None
     if verdicts is None:
@@ -217,7 +232,14 @@ async def review_batch(
 
     if not settings.image_enabled:
         return ReviewOutcome(False, kept, dropped, False)
-    return await _review_images(provider, kept, dropped, settings, max_images)
+    if image_provider is None:
+        # 配了图片审查却拿不到可用模型：文本段已判完，这里跳过而不是丢帖
+        logger.warning(
+            f"[{PLUGIN_NAME}] no usable provider for image review, "
+            "posts pushed without image review"
+        )
+        return ReviewOutcome(False, kept, dropped, False)
+    return await _review_images(image_provider, kept, dropped, settings, max_images)
 
 
 def images_for_item(item: dict[str, Any], max_images: int) -> list[str]:
@@ -262,10 +284,8 @@ async def _review_images(
     max_images: int,
 ) -> ReviewOutcome:
     """逐帖复审配图。图不过则丢整帖；单帖失败保留该帖，过半失败视为 provider 异常。"""
-    system_prompt = (
-        f"{IMAGE_RULES}\n\n补充规则：\n{settings.extra_rules}"
-        if settings.extra_rules
-        else IMAGE_RULES
+    system_prompt = build_system_prompt(
+        settings.image_prompt or IMAGE_RULES, settings.extra_rules
     )
     survivors: list[dict[str, Any]] = []
     attempted = 0

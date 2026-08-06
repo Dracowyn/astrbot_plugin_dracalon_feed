@@ -19,6 +19,7 @@ def build_lines(
     *,
     in_quiet_hours: bool,
     review_provider_available: bool,
+    image_provider_available: bool = True,
 ) -> list[str]:
     """拼装完整状态文案（不含首行以外的前缀/后缀，调用方直接 join 输出）。"""
     last_poll_at = int(st.get("last_poll_at", 0) or 0)
@@ -94,6 +95,8 @@ def build_lines(
         )
         if not review_settings.image_enabled:
             review_desc += "，配图审查已关"
+        elif not image_provider_available:
+            review_desc += "，配图审查无可用模型（图片不审直接推）"
 
     return [
         "Dracalon 新帖订阅 · 当前状态",

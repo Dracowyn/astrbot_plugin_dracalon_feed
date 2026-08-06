@@ -114,16 +114,24 @@
     "hint": "推送前让 LLM 判定每条帖子是否值得推，剔除灌水/测试/广告等内容"
   },
   "review_provider_id": {
-    "description": "审查使用的 Provider ID",
+    "description": "文本审查使用的模型",
     "type": "string",
+    "_special": "select_provider",
     "default": "",
-    "hint": "留空则用当前默认对话模型。建议指定一个便宜的模型"
+    "hint": "留空则用当前默认对话模型。只判标题去留，可以挑个便宜的纯文本模型"
+  },
+  "review_prompt": {
+    "description": "文本审查提示词",
+    "type": "text",
+    "default": "",
+    "editor_mode": true,
+    "hint": "留空=用内置规则。填了就整段替换内置规则；必须要求模型只输出 JSON 数组 [{\"i\": 编号, \"keep\": true/false, \"reason\": \"...\"}]，否则会被判为解析失败而推迟推送"
   },
   "review_extra_rules": {
     "description": "追加的审查规则",
     "type": "text",
     "default": "",
-    "hint": "拼在内置规则之后。用 /dracalon_feed filtered 看误杀情况来调这里"
+    "hint": "同时拼在文本与配图审查提示词之后（无论用的是内置规则还是你自定义的）。用 /dracalon_feed filtered 看误杀情况来调这里"
   },
   "review_max_attempts": {
     "description": "审查失败重试次数",
@@ -135,6 +143,20 @@
     "description": "单次审查调用超时（秒）",
     "type": "int",
     "default": 30
+  },
+  "image_review_provider_id": {
+    "description": "配图审查使用的模型",
+    "type": "string",
+    "_special": "select_provider",
+    "default": "",
+    "hint": "必须是支持图片输入的多模态模型。留空则用当前默认对话模型（不会继承上面的文本审查模型，避免把图发给纯文本模型）"
+  },
+  "image_review_prompt": {
+    "description": "配图审查提示词",
+    "type": "text",
+    "default": "",
+    "editor_mode": true,
+    "hint": "留空=用内置规则。填了就整段替换内置规则；必须要求模型只输出 JSON 对象 {\"keep\": true/false, \"reason\": \"...\"}，否则该帖会按保留处理"
   },
   "image_review_enabled": {
     "description": "启用配图审查",
