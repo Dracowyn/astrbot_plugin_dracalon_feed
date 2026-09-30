@@ -644,3 +644,99 @@ async def test_concurrent_flush_sends_batch_only_once(monkeypatch):
     assert Context.send_message.await_count == 1
     assert sorted([first[0], second[0]]) == [0, 1]
     assert plugin._state["digest_buffer"] == []
+
+
+REMOVED_FROM_GROUP = (
+    "<ActionFailed retcode=1200 message='EventChecker Failed: "
+    '{"result": 110, "errMsg": "发送失败，你已被移出该群，请重新加群。"}\'>'
+)
+
+
+@pytest.mark.asyncio
+async def test_permanent_failure_is_not_queued_for_retry(monkeypatch):
+    plugin = _plugin()
+    plugin.config = {"targets": ["gone", "ok"], "digest_enabled": False}
+    plugin._state["bootstrap_done"] = True
+    plugin._lock = asyncio.Lock()
+    plugin._save_state = AsyncMock()
+    plugin._fetch_page = AsyncMock(return_value=([_item("post")], 1))
+
+    class Context:
+        async def send_message(self, target, _chain):
+            if target == "gone":
+                raise RuntimeError(REMOVED_FROM_GROUP)
+            return True
+
+    async def no_sleep(_delay):
+        return None
+
+    plugin.context = Context()
+    monkeypatch.setattr(feed.asyncio, "sleep", no_sleep)
+
+    await plugin._poll_once()
+
+    assert plugin._state["pending_deliveries"] == []
+    assert "已被移出该群" in plugin._state["last_error"]
+
+
+@pytest.mark.asyncio
+async def test_retry_gives_up_after_max_attempts(monkeypatch):
+    plugin = _plugin()
+    plugin.config = {"targets": ["flaky"]}
+    plugin._state.update(
+        {
+            "bootstrap_done": True,
+            "pending_deliveries": [
+                {
+                    "item": _item("post"),
+                    "targets": ["flaky"],
+                    "attempts": feed.MAX_DELIVERY_ATTEMPTS - 1,
+                    "next_retry_at": 0,
+                }
+            ],
+        }
+    )
+    plugin._lock = asyncio.Lock()
+    plugin._save_state = AsyncMock()
+    plugin._fetch_page = AsyncMock(return_value=([], 0))
+
+    class Context:
+        send_message = AsyncMock(side_effect=RuntimeError("rich media transfer failed"))
+
+    async def no_sleep(_delay):
+        return None
+
+    plugin.context = Context()
+    monkeypatch.setattr(feed.asyncio, "sleep", no_sleep)
+
+    await plugin._poll_once()
+
+    Context.send_message.assert_awaited_once()
+    assert plugin._state["pending_deliveries"] == []
+
+
+@pytest.mark.asyncio
+async def test_test_command_reports_permanent_failure(monkeypatch):
+    plugin = _plugin()
+    plugin._session = object.__new__(feed.aiohttp.ClientSession)
+    monkeypatch.setattr(type(plugin._session), "closed", False, raising=False)
+    plugin._fetch_page = AsyncMock(return_value=([_item("post")], 1))
+
+    class Context:
+        send_message = AsyncMock(side_effect=RuntimeError(REMOVED_FROM_GROUP))
+
+    async def no_sleep(_delay):
+        return None
+
+    class Event:
+        unified_msg_origin = "gone"
+
+        def plain_result(self, text):
+            return text
+
+    plugin.context = Context()
+    monkeypatch.setattr(feed.asyncio, "sleep", no_sleep)
+
+    results = [r async for r in plugin.test(Event())]
+
+    assert results[0].startswith("发送失败")

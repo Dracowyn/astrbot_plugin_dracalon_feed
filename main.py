@@ -21,6 +21,10 @@ INTER_TARGET_DELAY = 0.3
 INTER_ITEM_DELAY = 0.5
 RETRY_BASE_SECONDS = 120
 RETRY_MAX_SECONDS = 3600
+# 超过这个次数仍投递失败的条目直接丢弃，避免积压无限重试（退避封顶后约 5 小时）
+MAX_DELIVERY_ATTEMPTS = 10
+# 平台返回这些错误时重试没有意义（例如机器人已被移出群），直接放弃该目标
+PERMANENT_DELIVERY_ERRORS = ("已被移出该群",)
 FILTERED_LOG_LIMIT = 10
 PROVIDER_WARN_INTERVAL = 3600
 
@@ -152,7 +156,7 @@ class DracalonFeedPlugin(Star):
         failed, error = await self._deliver_to_targets(
             items[0], [event.unified_msg_origin], chain=chain
         )
-        if failed:
+        if failed or error:
             yield event.plain_result(f"发送失败：{error or '平台未接受消息'}")
             return
         yield event.plain_result("已推送 1 条测试帖")
@@ -295,13 +299,17 @@ class DracalonFeedPlugin(Star):
     ) -> tuple[list[str], str]:
         """Deliver one feed item and report targets that need retrying.
 
+        Targets that fail with a permanent error (see ``PERMANENT_DELIVERY_ERRORS``)
+        are logged and reported in the error text but not returned for retry.
+
         Args:
             item: Feed item used to build the message and identify log entries.
             targets: Unified message origins that should receive the item.
             chain: Optional prebuilt message chain.
 
         Returns:
-            A tuple containing failed targets and a concise error description.
+            A tuple containing retryable failed targets and a concise description
+            of every failure, permanent ones included.
         """
         message = chain or render.build_chain(
             item, style=self._style(), max_images=self._max_images()
@@ -314,11 +322,14 @@ class DracalonFeedPlugin(Star):
                 if not sent:
                     raise RuntimeError("no matching platform")
             except Exception as e:
-                failed.append(umo)
+                permanent = any(m in str(e) for m in PERMANENT_DELIVERY_ERRORS)
+                if not permanent:
+                    failed.append(umo)
                 errors.append(f"{umo}: {type(e).__name__}: {e}")
                 logger.error(
                     f"[{PLUGIN_NAME}] delivery to {umo} failed "
-                    f"for item {item_key(item) or '(unknown)'}: {e}"
+                    f"for item {item_key(item) or '(unknown)'}"
+                    f"{' (permanent, not retrying)' if permanent else ''}: {e}"
                 )
             await asyncio.sleep(INTER_TARGET_DELAY)
         return failed, "; ".join(errors[-3:])
@@ -385,8 +396,16 @@ class DracalonFeedPlugin(Star):
                 failed, error = await self._deliver_to_targets(
                     entry["item"], retry_targets
                 )
-                if failed:
-                    attempts = int(entry.get("attempts", 0) or 0) + 1
+                if error:
+                    delivery_error = error
+                attempts = int(entry.get("attempts", 0) or 0) + 1
+                if failed and attempts >= MAX_DELIVERY_ATTEMPTS:
+                    logger.warning(
+                        f"[{PLUGIN_NAME}] giving up item "
+                        f"{item_key(entry['item']) or '(unknown)'} for {failed} "
+                        f"after {attempts} attempts"
+                    )
+                elif failed:
                     pending.append(
                         {
                             "item": entry["item"],
@@ -399,7 +418,6 @@ class DracalonFeedPlugin(Star):
                             ),
                         }
                     )
-                    delivery_error = error or delivery_error
                 await asyncio.sleep(INTER_ITEM_DELAY)
 
         async with self._lock:
@@ -624,16 +642,18 @@ class DracalonFeedPlugin(Star):
             failed, error = await self._deliver_to_targets(
                 batch[-1], targets, chain=chain
             )
-            if failed:
+            if failed or error:
                 async with self._lock:
-                    for item in batch:
-                        self._state.setdefault("pending_deliveries", []).append(
+                    # 永久性失败只带回错误信息，没有需要重试的目标
+                    if failed:
+                        self._state.setdefault("pending_deliveries", []).extend(
                             {
                                 "item": item,
                                 "targets": failed,
                                 "attempts": 1,
                                 "next_retry_at": int(time.time()) + RETRY_BASE_SECONDS,
                             }
+                            for item in batch
                         )
                     self._state["last_error"] = error or self._state.get(
                         "last_error", ""
