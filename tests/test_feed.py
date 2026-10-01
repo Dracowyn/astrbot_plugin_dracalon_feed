@@ -740,3 +740,46 @@ async def test_test_command_reports_permanent_failure(monkeypatch):
     results = [r async for r in plugin.test(Event())]
 
     assert results[0].startswith("发送失败")
+
+
+@pytest.mark.asyncio
+async def test_keyword_blocklist_drops_matching_titles_before_review(monkeypatch):
+    plugin = _plugin()
+    plugin.config = {
+        "targets": ["group"],
+        "digest_enabled": False,
+        "merge_push_enabled": False,
+        "keyword_blocklist": ["广告", " AD ", ""],
+    }
+    plugin._state["bootstrap_done"] = True
+    plugin._lock = asyncio.Lock()
+    plugin._save_state = AsyncMock()
+    items = [
+        {**_item("normal", "2026-08-01T00:00:01+00:00"), "title": "正常的帖子"},
+        {**_item("spam-cn", "2026-08-01T00:00:02+00:00"), "title": "出售广告位"},
+        {**_item("spam-en", "2026-08-01T00:00:03+00:00"), "title": "Big Ad here"},
+    ]
+    plugin._fetch_page = AsyncMock(return_value=(list(reversed(items)), len(items)))
+
+    class Context:
+        send_message = AsyncMock(return_value=True)
+
+    async def no_sleep(_delay):
+        return None
+
+    plugin.context = Context()
+    monkeypatch.setattr(feed.asyncio, "sleep", no_sleep)
+
+    await plugin._poll_once()
+
+    assert Context.send_message.await_count == 1
+    sent = Context.send_message.await_args.args[1].chain[0].text
+    assert "正常的帖子" in sent
+    assert plugin._state["watermark"] == feed_state.item_ts(items[-1])
+    recent = plugin._state["filtered_recent"]
+    assert {entry["title"] for entry in recent} == {"出售广告位", "Big Ad here"}
+    assert all(entry["source"] == "keyword" for entry in recent)
+    assert {entry["reason"] for entry in recent} == {
+        "命中关键词「广告」",
+        "命中关键词「AD」",
+    }

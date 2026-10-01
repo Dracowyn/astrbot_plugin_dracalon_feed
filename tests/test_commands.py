@@ -53,6 +53,7 @@ def test_conf_schema_declares_every_new_key():
         "review_timeout_seconds",
         "image_review_enabled",
         "image_review_max_per_batch",
+        "keyword_blocklist",
     ):
         assert key in schema, key
         assert "description" in schema[key]
@@ -134,3 +135,17 @@ def test_status_flags_missing_image_provider():
     )
 
     assert any("配图审查无可用模型" in line for line in lines)
+
+
+@pytest.mark.asyncio
+async def test_filtered_command_labels_keyword_drops():
+    plugin = _plugin()
+    plugin._state["filtered_recent"] = [
+        {"title": "出售广告位", "url": "u", "reason": "命中关键词「广告」",
+         "source": "keyword", "at": 0}
+    ]
+
+    lines = await _collect(plugin.filtered(_Event()))
+
+    assert "·关键词]" in lines[0]
+    assert "命中关键词「广告」" in lines[0]

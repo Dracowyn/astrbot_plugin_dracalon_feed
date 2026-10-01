@@ -196,12 +196,12 @@ class DracalonFeedPlugin(Star):
     @filter.permission_type(filter.PermissionType.ADMIN)
     @dracalon_feed.command("filtered")
     async def filtered(self, event: AstrMessageEvent):
-        """查看最近被 AI 审查丢弃的帖子"""
+        """查看最近被关键词或 AI 审查丢弃的帖子"""
         entries = list(self._state.get("filtered_recent") or [])
         if not entries:
-            yield event.plain_result("还没有被审查丢弃的帖子")
+            yield event.plain_result("还没有被过滤丢弃的帖子")
             return
-        source_label = {"text": "文本", "image": "配图"}
+        source_label = {"text": "文本", "image": "配图", "keyword": "关键词"}
         lines = [f"最近 {len(entries)} 条被丢弃的帖子："]
         for idx, entry in enumerate(entries, 1):
             at = int(entry.get("at", 0) or 0)
@@ -426,12 +426,16 @@ class DracalonFeedPlugin(Star):
 
         digest_settings = digest.settings_from_config(self.config)
 
+        # 关键词屏蔽：命中的帖子不进缓冲区（也就不进 AI 审查），但水位线照常推进
+        kept_items, blocked = self._apply_keyword_blocklist(new_items)
+
         # 收录：新帖入缓冲区的同时推进水位线。二者在同一把锁、同一次落盘里写入，
         # 因此不存在「水位线推进了但帖子丢了」的撕裂窗口。
         async with self._lock:
-            digest.enqueue(self._state, new_items)
+            digest.enqueue(self._state, kept_items)
             for item in new_items:
                 state.advance_watermark(self._state, item)
+            self._record_filtered(blocked)
             if in_quiet:
                 self._state["was_quiet"] = True
             self._state["last_poll_at"] = int(time.time())
@@ -586,6 +590,42 @@ class DracalonFeedPlugin(Star):
             str(self.config.get("image_review_provider_id", "") or "").strip(),
             "image review",
         )
+
+    def _apply_keyword_blocklist(
+        self, items: list[dict[str, Any]]
+    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+        """按 keyword_blocklist 筛掉标题命中关键词的帖子（不区分大小写的子串匹配）。
+
+        Args:
+            items: 本轮新帖。
+
+        Returns:
+            (保留的帖子, 被屏蔽的条目)。被屏蔽条目的格式与审查丢弃一致，
+            可直接交给 _record_filtered。
+        """
+        keywords = [
+            str(k).strip()
+            for k in self.config.get("keyword_blocklist", []) or []
+            if str(k).strip()
+        ]
+        if not keywords:
+            return list(items), []
+        kept: list[dict[str, Any]] = []
+        blocked: list[dict[str, Any]] = []
+        for item in items:
+            title = str(item.get("title") or "").casefold()
+            hit = next((k for k in keywords if k.casefold() in title), None)
+            if hit is None:
+                kept.append(item)
+                continue
+            blocked.append(
+                {"item": item, "reason": f"命中关键词「{hit}」", "source": "keyword"}
+            )
+            logger.info(
+                f"[{PLUGIN_NAME}] blocked item {item_key(item) or '(unknown)'} "
+                f"by keyword {hit!r}"
+            )
+        return kept, blocked
 
     def _record_filtered(self, dropped: list[dict[str, Any]]) -> None:
         """把被毙掉的帖记进环形日志，供 /dracalon_feed filtered 调 prompt 用。

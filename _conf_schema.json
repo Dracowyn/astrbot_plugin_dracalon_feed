@@ -107,6 +107,12 @@
     "default": 10,
     "hint": "缓冲区攒够这么多条时立即推送，不等窗口到期"
   },
+  "keyword_blocklist": {
+    "description": "屏蔽关键词",
+    "type": "list",
+    "default": [],
+    "hint": "标题包含任一关键词（不区分大小写）的帖子直接丢弃：不进 AI 审查，也不推送。被屏蔽的帖子可用 /dracalon_feed filtered 查看。"
+  },
   "review_enabled": {
     "description": "启用 AI 内容审查",
     "type": "bool",
